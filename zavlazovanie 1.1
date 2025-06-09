@@ -1,0 +1,177 @@
+substitutions:
+  system_name: zavlazovanie
+  friendly_name: zavlazovanie
+  relay_gpio: D5  #D5=GPIO14
+  #dht22_gpio: D3 # Zostáva zakomentované, keďže je D3 použité priamo
+  button_switch_gpio: D2
+  soil_moisture_adc: A0
+  
+esphome:
+  name: "esph_${system_name}"
+
+esp8266:
+  board: nodemcu
+  
+wifi:
+  ssid: "Skynet"
+  password: "Cm31ka88"
+  power_save_mode: NONE # Pre rýchlejšiu odozvu
+
+api:
+
+ota:
+  platform: esphome
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+captive_portal:
+
+logger:
+  #level: DEBUG #DEBUG, VERY_VERBOSE
+
+text_sensor:
+  - platform: version
+    name: "esph_${system_name}_version"
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGD("main", "The current version is %s", x.c_str());
+  - platform: wifi_info
+    ip_address:
+      name: esph_${system_name}_ip
+    ssid:
+      name: esph_${system_name}_ssid
+    bssid:
+      name: esph_${system_name}_bssid
+
+switch:
+  ## relay / pump - used by ESPHome internally, not visible from HomeAssistant
+  - platform: gpio
+    id: relay
+    restore_mode: ALWAYS_OFF # Dôležité pre bezpečnosť
+    #name: "${system_name} Relay" # Môže byť zakomentované, ak sa nepoužíva v HA
+    pin: 
+      number: $relay_gpio 
+      inverted: True # Predpoklad aktívneho nízkeho relé
+    on_turn_on:
+      then:
+        # Žiadne akcie tu, ak sú ovládané timed_pump alebo pump
+    on_turn_off:
+      then:
+        # Nastavenie času posledného zavlažovania (centralizované)
+        - homeassistant.service:        
+            service: input_datetime.set_datetime
+            data_template:          
+              entity_id: "input_datetime.esph_${system_name}_triggered" 
+              datetime: !lambda return id(homeassistant_time).now().strftime("%Y-%m-%d %H:%M:%S");
+              
+        # Odoslanie notifikácie (centralizované s fixom pre message)
+        - homeassistant.service:
+            service: notify.html5_notification
+            data:
+              title: Plants Watered
+              message: !lambda return "Plants were watered at " + id(homeassistant_time).now().strftime("%Y-%m-%d %H:%M:%S") + ".";
+
+
+  ## Timed Pump
+  - platform: template
+    name: "esph_${system_name}_timed_pump"
+    id: timed_pump
+    icon: "mdi:siren"
+    lambda: !lambda |-    
+      if (id(relay).state) {
+        return true;
+      } else {
+        return false;
+      }
+    turn_on_action:
+    - switch.turn_on: relay
+    - delay: !lambda return (id(Dlzka_polievania).state * 1000); # Hodnota z HA
+    - switch.turn_off: relay
+    # Odstránené duplicitné volanie input_datetime.set_datetime
+
+
+  ## Normal Pump
+  - platform: template
+    name: "esph_${system_name}_pump"
+    id: pump
+    icon: "mdi:siren"
+    lambda: !lambda |-    
+      if (id(relay).state) {
+        return true;
+      } else {
+        return false;
+      }
+    turn_on_action:
+    - switch.turn_on: relay
+    turn_off_action:
+    - switch.turn_off: relay
+    # Odstránené duplicitné volanie input_datetime.set_datetime
+
+binary_sensor:
+  #Breadboard Button
+  - platform: gpio
+    id: button_switch
+    pin: 
+      number: $button_switch_gpio
+      mode: INPUT_PULLUP
+      inverted: TRUE
+    filters:
+      - delayed_on_off: 200ms
+    on_press:
+      then:
+        - switch.toggle: relay
+
+sensor:
+  - platform: homeassistant
+    name: "Dlzka_polievania"
+    entity_id: input_number.Dlzka_polievania
+    id: "Dlzka_polievania"
+    # internal: true # Zvážte pridanie, ak nechcete vidieť tento senzor v HA
+
+  - platform: wifi_signal
+    name: "esph_${system_name}_wifi_signal"
+    update_interval: 300s
+
+  - platform: uptime
+    name: "esph_${system_name}_uptime"
+    update_interval: 30s
+
+  - platform: adc  #Volts will flow to Template Sensor Below
+    pin: $soil_moisture_adc
+    name: "esph_${system_name}_soil_v"
+    id: soil_v
+    update_interval: 160s
+    unit_of_measurement: 'V' # Zmena na veľké V pre jednotky Volty
+    accuracy_decimals: 2
+
+  - platform: dht
+    pin: D3
+    temperature:
+      name: "Teplota_zalievanie"
+      id: teplota
+    humidity:
+      name: "Vlhkost_zalievanie" # Oprava pre consistency
+      id: vlhkost
+    update_interval: 300s
+    
+  - platform: template
+    name: "esph_${system_name}_vlhkost_pody_percent"
+    id: _vlhkost_pody_percent
+    unit_of_measurement: '%'
+    icon: "mdi:water-percent"
+    update_interval: 160s
+    accuracy_decimals: 0
+      # Bryan Reading: 0.20 = in water, 0.30 = dry (potvrďte tieto hodnoty pre váš senzor!)
+    lambda: |-
+      const float x = id(soil_v).state;
+      ESP_LOGD("main", "Soil voltage: %.2fV", x); # Logovanie presunuté pred return
+      if (x > 0.3) { # Ak je napätie vyššie ako 0.3V, je to veľmi suché (0%)
+        return 0;
+      } else if (x < 0.2) { # Ak je napätie nižšie ako 0.2V, je to plne mokré (100%)
+        return 100;
+      } else { # Lineárna interpolácia medzi 0.2V a 0.3V
+        return (0.30 - x) / (0.30-0.20) * 100.0;
+      }
