@@ -7,7 +7,7 @@ substitutions:
   soil_moisture_adc: A0
   
 esphome:
-  name: "esph_${system_name}"
+  name: "esph_${system_name}" # Upozornenie: podčiarkovníky v názve hostiteľa môžu spôsobiť problémy s niektorými sieťovými službami. Zvážte zmenu na "esph-${system_name}" alebo "esph${system_name}".
 
 esp8266:
   board: nodemcu
@@ -20,7 +20,7 @@ wifi:
 api:
 
 ota:
-  platform: esphome
+  platform: esphome # OPRAVA: Pridaná platforma pre OTA
 
 time:
   - platform: homeassistant
@@ -29,7 +29,7 @@ time:
 captive_portal:
 
 logger:
-  #level: DEBUG #DEBUG, VERY_VERBOSE
+  #level: DEBUG # DEBUG, VERY_VERBOSE (odomknite pre detailné logy)
 
 text_sensor:
   - platform: version
@@ -50,24 +50,25 @@ switch:
   ## relay / pump - used by ESPHome internally, not visible from HomeAssistant
   - platform: gpio
     id: relay
-    restore_mode: ALWAYS_OFF # Dôležité pre bezpečnosť
-    #name: "${system_name} Relay" # Môže byť zakomentované, ak sa nepoužíva v HA
+    restore_mode: ALWAYS_OFF # Dôležité pre bezpečnosť, zaisťuje, že relé je po reštarte vypnuté
+    #name: "${system_name} Relay" # Môže byť zakomentované, ak sa nepoužíva priamo v Home Assistant
     pin: 
       number: $relay_gpio 
       inverted: True # Predpoklad aktívneho nízkeho relé
     on_turn_on:
       then:
-        # Žiadne akcie tu, ak sú ovládané timed_pump alebo pump
+        # Žiadne akcie pri zapnutí, ak sú riadené timed_pump alebo pump
+        # Ak by ste chceli logovať, že sa pumpa zapla, môžete pridať ESP_LOGD()
     on_turn_off:
       then:
-        # Nastavenie času posledného zavlažovania (centralizované)
+        # Nastavenie času posledného zavlažovania (centralizované, spustí sa po každom vypnutí relé)
         - homeassistant.service:        
             service: input_datetime.set_datetime
             data_template:          
               entity_id: "input_datetime.esph_${system_name}_triggered" 
               datetime: !lambda return id(homeassistant_time).now().strftime("%Y-%m-%d %H:%M:%S");
               
-        # Odoslanie notifikácie (centralizované s fixom pre message)
+        # Odoslanie notifikácie (centralizované s fixom pre dynamickú správu)
         - homeassistant.service:
             service: notify.html5_notification
             data:
@@ -75,7 +76,7 @@ switch:
               message: !lambda return "Plants were watered at " + id(homeassistant_time).now().strftime("%Y-%m-%d %H:%M:%S") + ".";
 
 
-  ## Timed Pump
+  ## Timed Pump - Ovláda relé na určitý čas
   - platform: template
     name: "esph_${system_name}_timed_pump"
     id: timed_pump
@@ -88,12 +89,11 @@ switch:
       }
     turn_on_action:
     - switch.turn_on: relay
-    - delay: !lambda return (id(Dlzka_polievania).state * 1000); # Hodnota z HA
+    - delay: !lambda return (id(Dlzka_polievania).state * 1000); # Hodnota Dlzka_polievania z Home Assistant (v sekundách, prepočítaná na ms)
     - switch.turn_off: relay
-    # Odstránené duplicitné volanie input_datetime.set_datetime
+    # Odstránené duplicitné volanie homeassistant.service, pretože sa vykoná v 'relay' on_turn_off
 
-
-  ## Normal Pump
+  ## Normal Pump - Priame ovládanie relé
   - platform: template
     name: "esph_${system_name}_pump"
     id: pump
@@ -108,70 +108,70 @@ switch:
     - switch.turn_on: relay
     turn_off_action:
     - switch.turn_off: relay
-    # Odstránené duplicitné volanie input_datetime.set_datetime
+    # Odstránené duplicitné volanie homeassistant.service, pretože sa vykoná v 'relay' on_turn_off
 
 binary_sensor:
-  #Breadboard Button
+  # Breadboard Button
   - platform: gpio
     id: button_switch
     pin: 
       number: $button_switch_gpio
-      mode: INPUT_PULLUP
-      inverted: TRUE
+      mode: INPUT_PULLUP # Používa interný pull-up rezistor pre jednoduché tlačidlo k GND
+      inverted: TRUE # Tlačidlo je aktívne nízko (stlačené = GND)
     filters:
-      - delayed_on_off: 200ms
+      - delayed_on_off: 200ms # Debouncing pre stabilnejšie čítanie tlačidla
     on_press:
       then:
-        - switch.toggle: relay
+        - switch.toggle: relay # Prepne stav relé (zapne/vypne pumpu)
 
 sensor:
   - platform: homeassistant
     name: "Dlzka_polievania"
     entity_id: input_number.Dlzka_polievania
     id: "Dlzka_polievania"
-    # internal: true # Zvážte pridanie, ak nechcete vidieť tento senzor v HA
+    # internal: true # Zvážte pridanie, ak nechcete, aby bol tento senzor viditeľný v Home Assistant ako samostatná entita
 
   - platform: wifi_signal
     name: "esph_${system_name}_wifi_signal"
-    update_interval: 300s
+    update_interval: 300s # Aktualizuje silu WiFi signálu každých 5 minút
 
   - platform: uptime
     name: "esph_${system_name}_uptime"
-    update_interval: 30s
+    update_interval: 30s # Aktualizuje čas od posledného reštartu každých 30 sekúnd
 
-  - platform: adc  #Volts will flow to Template Sensor Below
+  - platform: adc  # Volty z ADC pinu A0 pre senzor vlhkosti pôdy
     pin: $soil_moisture_adc
     name: "esph_${system_name}_soil_v"
     id: soil_v
-    update_interval: 160s
-    unit_of_measurement: 'V' # Zmena na veľké V pre jednotky Volty
-    accuracy_decimals: 2
+    update_interval: 160s # Aktualizuje hodnotu každých 160 sekúnd
+    unit_of_measurement: 'V' # Jednotka merania je Volty
+    accuracy_decimals: 2 # Zaokrúhli na dve desatinné miesta
 
-  - platform: dht
-    pin: D3
+  - platform: dht # Senzor teploty a vlhkosti DHT
+    pin: D3 # Pin, ku ktorému je pripojený DHT senzor
     temperature:
       name: "Teplota_zalievanie"
       id: teplota
     humidity:
-      name: "Vlhkost_zalievanie" # Oprava pre consistency
+      name: "Vlhkost_zalievanie" # Zmenené na podčiarkovník pre konzistenciu
       id: vlhkost
-    update_interval: 300s
+    update_interval: 300s # Aktualizuje hodnoty DHT každých 5 minút
     
-  - platform: template
+  - platform: template # Prepočet napätia na percentá vlhkosti pôdy
     name: "esph_${system_name}_vlhkost_pody_percent"
     id: _vlhkost_pody_percent
-    unit_of_measurement: '%'
-    icon: "mdi:water-percent"
-    update_interval: 160s
-    accuracy_decimals: 0
-      # Bryan Reading: 0.20 = in water, 0.30 = dry (potvrďte tieto hodnoty pre váš senzor!)
+    unit_of_measurement: '%' # Jednotka merania je percentá
+    icon: "mdi:water-percent" # Ikona pre vlhkosť
+    update_interval: 160s # Aktualizuje sa rovnako často ako ADC senzor
+    accuracy_decimals: 0 # Zaokrúhli na celé percentá
+      # DÔLEŽITÉ: Prahy 0.20V (mokré) a 0.30V (suché) si overte pre váš konkrétny senzor!
     lambda: |-
       const float x = id(soil_v).state;
-      ESP_LOGD("main", "Soil voltage: %.2fV", x); # Logovanie presunuté pred return
-      if (x > 0.3) { # Ak je napätie vyššie ako 0.3V, je to veľmi suché (0%)
+      ESP_LOGD("main", "Soil voltage: %.2fV", x); // Logovanie hodnoty napätia pre debug
+      if (x > 0.3) { // Ak je napätie vyššie ako 0.3V, je to považované za úplne suché (0% vlhkosti)
         return 0;
-      } else if (x < 0.2) { # Ak je napätie nižšie ako 0.2V, je to plne mokré (100%)
+      } else if (x < 0.2) { // Ak je napätie nižšie ako 0.2V, je to považované za plne mokré (100% vlhkosti)
         return 100;
-      } else { # Lineárna interpolácia medzi 0.2V a 0.3V
-        return (0.30 - x) / (0.30-0.20) * 100.0;
+      } else { // Lineárna interpolácia medzi 0.2V (100%) a 0.3V (0%)
+        return (0.30 - x) / (0.30 - 0.20) * 100.0;
       }
