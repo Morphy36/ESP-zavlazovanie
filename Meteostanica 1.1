@@ -1,4 +1,4 @@
-# --- Začiatok Opraveného Kódu ---  
+# --- Začiatok Finálne Opraveného Kódu ---  
 esphome:  
   name: vonkajsia-stanica  
 
@@ -108,7 +108,7 @@ binary_sensor:
     id: rain_detection  
     lambda: |-  
       auto sensor = id(rain_sensor_percent);  
-      return sensor && sensor->has_state() && sensor->state > 5.0;  
+      return sensor && sensor->has_state() && sensor->state > 5.0f;  
     filters:  
       - delayed_on: 5s  
       - delayed_off: 5s  
@@ -120,7 +120,7 @@ binary_sensor:
     device_class: "battery"  
     lambda: |-  
       auto sensor = id(battery_voltage);  
-      return sensor && sensor->has_state() && sensor->state < 3.0;  
+      return sensor && sensor->has_state() && sensor->state < 3.0f;  
     filters:  
       - delayed_on: 10s  
 
@@ -143,7 +143,7 @@ binary_sensor:
       float pressure_change = current_pressure - last_pressure;  
       last_pressure = current_pressure;  
 
-      if (pressure_change < -1.0) {  
+      if (pressure_change < -1.0f) {  
         ESP_LOGD("rain_prediction", "Pressure drop detected (%.2f hPa). Predicting rain.", pressure_change);  
         return true;  
       } else {  
@@ -234,7 +234,7 @@ text_sensor:
 sensor:  
   # --- Senzory pre Dážď ---  
 
-  # 1. TOTO JE POMOCNÝ SENZOR NA KALIBRÁCIU - meria len surové napätie  
+  # 1. POMOCNÝ SENZOR NA KALIBRÁCIU - meria len surové napätie  
   - platform: adc  
     pin: GPIO34  
     name: "Dazdovy Senzor RAW Napatie"  
@@ -244,7 +244,7 @@ sensor:
     accuracy_decimals: 3  
     unit_of_measurement: "V"  
 
-  # 2. TOTO JE HLAVNÝ SENZOR - berie hodnotu z toho horného a prepočíta ju na percentá  
+  # 2. HLAVNÝ SENZOR - berie hodnotu z toho horného a prepočíta ju na percentá  
   - platform: template  
     name: "Vlhkosť dažďového senzora"  
     id: rain_sensor_percent  
@@ -253,16 +253,20 @@ sensor:
     state_class: "measurement"  
     lambda: |-  
       // DÔLEŽITÉ: Nahraď hodnoty nižšie tvojimi vlastnými nameranými hodnotami!  
-      // Použi na to hodnoty zo senzora "Dazdovy Senzor RAW Napatie".  
-      const float SUCHY_STAV_V = 1.152; // Tvoja hodnota pre sucho  
-      const float MOKRY_STAV_V = 0.231; // Tvoja hodnota pre mokro  
+      const float SUCHY_STAV_V = 1.152f;  
+      const float MOKRY_STAV_V = 0.231f;  
       
-      // Zoberie hodnotu z horného senzora  
-      float x = id(rain_sensor_raw_voltage).state;  
-      
-      // Mapovanie rozsahu napätia (sucho -> mokro) na percentá (0% -> 100%)  
-      float percenta = map(x, SUCHY_STAV_V, MOKRY_STAV_V, 0.0, 100.0);  
-      return clamp(percenta, 0.0, 100.0);  
+      if (id(rain_sensor_raw_voltage).has_state()) {  
+        float x = id(rain_sensor_raw_voltage).state;  
+        
+        // Mapovanie rozsahu napätia (sucho -> mokro) na percentá (0% -> 100%)  
+        float percenta = map(x, SUCHY_STAV_V, MOKRY_STAV_V, 0.0f, 100.0f);  
+        
+        // Orezanie hodnoty medzi 0 a 100  
+        return clamp(percenta, 0.0f, 100.0f);  
+      } else {  
+        return {}; // Vráti "unknown", ak RAW senzor nemá stav  
+      }  
     update_interval: 10s  
 
   # --- OSTATNÉ SENZORY ---  
@@ -317,13 +321,15 @@ sensor:
     unit_of_measurement: "%"  
     device_class: "battery"  
     lambda: |-  
-      auto batt_volt_sensor = id(battery_voltage);  
-      if (!batt_volt_sensor || !batt_volt_sensor->has_state() || isnan(batt_volt_sensor->state)) { return NAN; }  
-      float voltage = batt_volt_sensor->state;  
-      const float V_MAX = 4.2;  
-      const float V_MIN = 3.0;  
-      float level = 100.0 * (voltage - V_MIN) / (V_MAX - V_MIN);  
-      return clamp(level, 0.0f, 100.0f);  
+      if (id(battery_voltage).has_state()) {  
+        float voltage = id(battery_voltage).state;  
+        const float V_MAX = 4.2f;  
+        const float V_MIN = 3.0f;  
+        float level = 100.0f * (voltage - V_MIN) / (V_MAX - V_MIN);  
+        return clamp(level, 0.0f, 100.0f);  
+      } else {  
+        return {};  
+      }  
     update_interval: 30s  
 
   - platform: wifi_signal  
@@ -333,3 +339,4 @@ sensor:
     entity_category: diagnostic  
 
 # --- Koniec Kódu ---  
+    
