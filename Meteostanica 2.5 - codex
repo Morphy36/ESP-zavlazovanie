@@ -1,0 +1,1089 @@
+substitutions:
+  dev_name: "vonkajsia-stanica"
+  friendly_name: "Vonkajšia Meteostanica"
+  altitude_meters: "250"
+  batt_multiplier: "2.0"
+  batt_min_voltage: "3.0"
+  batt_max_voltage: "4.2"
+
+  sleep_storm_mode_ms: "120000"
+  sleep_normal_mode_ms: "600000"
+  sleep_eco_mode_ms: "1800000"
+  sleep_perf_mode_ms: "300000"
+  sleep_failsafe: "4min"
+
+  rain_calib_dry: "1.033"
+  rain_calib_wet: "0.419"
+  wind_pullup_res: "10000"
+  wifi_ap_timeout: "1min"
+
+  wind_storm_threshold: "15.0"
+  bat_eco_threshold: "20.0"
+  bat_storm_min: "30.0"
+  bat_perf_threshold: "80.0"
+  rain_moisture_threshold: "15.0"   # zvýšený prah proti šumu
+
+  frost_temp_threshold: "3.0"
+  storm_pressure_drop: "-2.5"
+
+esphome:
+  name: ${dev_name}
+  friendly_name: ${friendly_name}
+  project:
+    name: "custom.meteostanica"
+    version: "3.1.0"
+
+  on_boot:
+    priority: 600
+    then:
+      - script.execute: failsafe_guard
+      - lambda: |-
+          id(boot_count) += 1;
+          ESP_LOGI("boot", "=== BOOT #%d ===", id(boot_count));
+      - output.turn_on: rain_sensor_power
+      - output.turn_on: i2c_sensor_power
+      - delay: 2000ms
+      - script.execute: init_i2c_sensors
+      - if:
+          condition:
+            lambda: 'return id(i2c_initialized);'
+          then:
+            - component.update: bme280_sensor
+            - delay: 150ms
+            - component.update: bme280_sensor
+            - delay: 150ms
+            - component.update: bme280_sensor
+            - delay: 100ms
+      - component.update: battery_voltage
+      - component.update: ltr390_sensor
+      - script.execute: wifi_connect_logic
+
+  on_shutdown:
+    then:
+      - logger.log:
+          level: INFO
+          tag: "shutdown"
+          format: "Vypínam senzory a idem spať."
+      - script.execute: uspat_ltr390
+      - output.turn_off: rain_sensor_power
+      - output.turn_off: i2c_sensor_power
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: light
+  fast_connect: true
+  output_power: 8.5dBm
+  manual_ip:
+    static_ip: 192.168.0.249
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+    dns1: 192.168.0.1
+  ap:
+    ssid: "Meteo Stanica AP"
+    password: "MeteoStanicaAP"
+    ap_timeout: ${wifi_ap_timeout}
+  on_connect:
+    then:
+      - logger.log:
+          level: INFO
+          tag: "wifi"
+          format: "WiFi OK. IP: 192.168.0.249 | RSSI: %d dBm"
+          args: ['WiFi.RSSI()']
+      - lambda: 'id(wifi_fail_count) = 0;'
+  on_disconnect:
+    then:
+      - lambda: |-
+          id(wifi_fail_count) += 1;
+          ESP_LOGW("wifi", "WiFi odpojené. Zlyhaní za sebou: %d", id(wifi_fail_count));
+
+api:
+  id: api_server
+  reboot_timeout: 0s
+  on_client_connected:
+    then:
+      - logger.log:
+          level: INFO
+          tag: "api"
+          format: "HA klient pripojený — Blokujem Deep Sleep."
+      - deep_sleep.prevent: deep_sleep_control
+      - script.stop: failsafe_guard
+  on_client_disconnected:
+    then:
+      - logger.log:
+          level: INFO
+          tag: "api"
+          format: "HA klient odpojený — Idem spať."
+      - deep_sleep.allow: deep_sleep_control
+      - delay: 2s
+      - script.stop: periodic_sleep_check
+      - script.execute: check_and_enter_deep_sleep
+
+ota:
+  platform: esphome
+
+logger:
+  level: WARN
+  baud_rate: 0
+
+i2c:
+  sda: GPIO22
+  scl: GPIO21
+  scan: false
+  id: busa
+  frequency: 100kHz
+  timeout: 50ms
+
+globals:
+  - id: pressure_history
+    type: float[6]
+    restore_value: true
+    initial_value: "{NAN, NAN, NAN, NAN, NAN, NAN}"
+  - id: history_index
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: pressure_time_index
+    type: int[6]
+    restore_value: true
+    initial_value: "{0, 0, 0, 0, 0, 0}"
+  - id: pressure_trend_value
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+  - id: prev_humidity
+    type: float
+    restore_value: true
+    initial_value: "NAN"
+  - id: pressure_threshold
+    type: float
+    restore_value: true
+    initial_value: "-0.3"
+  - id: humidity_threshold
+    type: float
+    restore_value: true
+    initial_value: "80.0"
+  - id: i2c_restart_attempts
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: i2c_initialized
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: boot_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: last_sleep_mode
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: wifi_fail_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: sensor_error_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: daily_rain_accumulator
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+  - id: last_sleep_duration_s
+    type: float
+    restore_value: true
+    initial_value: "600.0"
+
+sensor:
+  - platform: bme280_i2c
+    address: 0x76
+    i2c_id: busa
+    id: bme280_sensor
+    update_interval: never
+    temperature:
+      name: "Vonkajšia Teplota"
+      id: bme280_temperature
+      oversampling: 4x
+      filters:
+        - offset: 0.0
+        - lambda: |-
+            if (x < -40.0f || x > 60.0f) {
+              ESP_LOGW("bme280", "Odmietnutá teplota: %.1f°C", x);
+              id(sensor_error_count) += 1;
+              return {};
+            }
+            id(sensor_error_count) = 0;
+            return x;
+    pressure:
+      name: "Absolútny tlak"
+      id: bme280_pressure
+      oversampling: 4x
+      filters:
+        - lambda: |-
+            if (x < 800.0f || x > 1100.0f) {
+              ESP_LOGW("bme280", "Odmietnutý tlak: %.1f hPa", x);
+              return {};
+            }
+            return x;
+      on_value:
+        then:
+          - lambda: |-
+              float h = ${altitude_meters};
+              float t = id(bme280_temperature).has_state() ? id(bme280_temperature).state : 15.0f;
+              float msl = x * pow(1.0f - (0.0065f * h) / (t + 0.0065f * h + 273.15f), -5.257f);
+              id(msl_pressure).publish_state(msl);
+          - script.execute: update_pressure_trend
+    humidity:
+      name: "Vonkajšia Vlhkosť"
+      id: bme280_humidity
+      oversampling: 4x
+      filters:
+        - lambda: |-
+            if (x < 0.0f || x > 100.0f) {
+              ESP_LOGW("bme280", "Odmietnutá vlhkosť: %.1f%%", x);
+              return {};
+            }
+            return x;
+
+  - platform: ltr390
+    address: 0x53
+    i2c_id: busa
+    id: ltr390_sensor
+    update_interval: never
+    gain: "X3"
+    resolution: 18
+    light:
+      name: "Intenzita svetla"
+      id: ambient_light
+      filters:
+        - lambda: 'return (x < 0.0f) ? 0.0f : x;'
+    uv:
+      name: "UV Index (RAW)"
+      id: uv_raw_data
+      internal: true
+
+  - platform: adc
+    pin: GPIO35
+    name: "Napätie batérie"
+    id: battery_voltage
+    update_interval: never
+    attenuation: 12db
+    accuracy_decimals: 2
+    filters:
+      - multiply: ${batt_multiplier}
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+      - lambda: |-
+          if (x < 2.5f || x > 5.0f) {
+            ESP_LOGW("battery", "Podozrivé napätie: %.2fV", x);
+            return {};
+          }
+          return x;
+
+  - platform: adc
+    pin: GPIO34
+    id: rain_sensor_voltage
+    name: "Napätie dažďového senzora"
+    entity_category: diagnostic
+    update_interval: never
+    attenuation: 12db
+    filters:
+      - median:
+          window_size: 7
+          send_every: 1
+          send_first_at: 1
+
+  - platform: template
+    name: "Vlhkosť dažďového senzora"
+    id: rain_sensor_percent
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    update_interval: never
+    lambda: |-
+      if (!id(rain_sensor_voltage).has_state()) return NAN;
+      float val = id(rain_sensor_voltage).state;
+      float dry = ${rain_calib_dry};
+      float wet = ${rain_calib_wet};
+      if (abs(dry - wet) < 0.01f) return NAN;
+      return clamp((val - dry) / (wet - dry) * 100.0f, 0.0f, 100.0f);
+
+  - platform: pulse_counter
+    pin:
+      number: GPIO25
+      mode: INPUT_PULLUP
+    name: "Rýchlosť vetra (Priemer)"
+    id: wind_speed
+    unit_of_measurement: "km/h"
+    update_interval: 3s        # rýchlejšie čítanie
+    use_pcnt: false
+    internal_filter: 20ms      # silnejší debounce
+    filters:
+      - multiply: 0.04
+      - lambda: 'return (x < 0.3f) ? 0.0f : x;'  # jemnejší prah
+
+  - platform: copy
+    source_id: wind_speed
+    name: "Rýchlosť vetra (Náraz-Gust)"
+    id: wind_gust
+    filters:
+      - max:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+
+  - platform: pulse_counter
+    pin:
+      number: GPIO26
+      mode: INPUT_PULLUP
+    name: "Intenzita zrážok"
+    id: rain_fall_rate
+    unit_of_measurement: "mm/h"
+    update_interval: 60s
+    use_pcnt: false
+    internal_filter: 200ms      # silnejší debounce
+    filters:
+      - multiply: 16.764
+    total:
+      name: "Celkové zrážky"
+      id: rain_total
+      unit_of_measurement: "mm"
+      accuracy_decimals: 2
+      filters:
+        - multiply: 0.2794
+      on_value:
+        then:
+          - lambda: 'id(daily_rain_accumulator) = x;'
+
+  - platform: adc
+    pin: GPIO33
+    id: wind_vane_voltage
+    internal: true
+    update_interval: 5s        # častejšie
+    attenuation: 12db
+    filters:
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+
+  - platform: template
+    name: "Smer vetra (Uhol)"
+    id: wind_direction_angle
+    unit_of_measurement: "°"
+    icon: "mdi:compass-rose"
+    lambda: |-
+      if (!id(wind_vane_voltage).has_state()) return NAN;
+      float v = id(wind_vane_voltage).state;
+      if (v < 0.05f || !id(wind_speed).has_state() || id(wind_speed).state < 0.5f) return NAN;
+      float r_vane = ${wind_pullup_res} * ((3.3f / v) - 1.0f);
+      struct WindDir { float resistance; float angle; };
+      static const WindDir dirs[] = {
+        {688,112.5},{891,67.5},{1000,90},{1410,157.5},
+        {2200,135},{3140,202.5},{3900,180},{6570,22.5},
+        {8200,45},{14120,247.5},{16000,225},{21880,337.5},
+        {33000,0},{42120,292.5},{64900,315},{120000,270}
+      };
+      float min_ratio = 1000.0f;
+      float best_angle = NAN;
+      for (int i = 0; i < 16; i++) {
+        float ratio = abs(r_vane - dirs[i].resistance) / dirs[i].resistance;
+        if (ratio < min_ratio) { min_ratio = ratio; best_angle = dirs[i].angle; }
+      }
+      if (min_ratio > 0.30f) {
+        ESP_LOGW("wind_dir", "Neznámy odpor: %.0f Ohm", r_vane);
+        return NAN;
+      }
+      return best_angle;
+
+  - platform: template
+    name: "Tlak (Hladina mora)"
+    id: msl_pressure
+    unit_of_measurement: "hPa"
+    accuracy_decimals: 1
+    icon: "mdi:gauge"
+    device_class: atmospheric_pressure
+    state_class: measurement
+
+  - platform: template
+    name: "Tlakový trend"
+    id: pressure_trend_sensor
+    unit_of_measurement: "hPa/h"
+    accuracy_decimals: 2
+    icon: "mdi:trending-down"
+    state_class: measurement
+    update_interval: never
+    lambda: 'return id(pressure_trend_value);'
+
+  - platform: template
+    name: "Rosný bod"
+    id: dew_point
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer-water"
+    device_class: temperature
+    state_class: measurement
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      if (RH <= 0.0f) return NAN;
+      float a = 17.27f, b = 237.7f;
+      float alpha = ((a * T) / (b + T)) + log(RH / 100.0f);
+      if (abs(a - alpha) < 0.001f) return NAN;
+      return (b * alpha) / (a - alpha);
+
+  - platform: template
+    name: "Absolútna vlhkosť"
+    id: absolute_humidity
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 1
+    icon: "mdi:water"
+    state_class: measurement
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      float es = 6.112f * exp((17.67f * T) / (T + 243.5f));
+      return ((RH / 100.0f) * es * 2165.0f) / (T + 273.15f);
+
+  - platform: template
+    name: "Index tepelného komfortu"
+    id: comfort_index
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    icon: "mdi:thermometer-check"
+    state_class: measurement
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      return T - (0.55f - 0.0055f * RH) * (T - 14.5f);
+
+  - platform: template
+    name: "Pocitová teplota"
+    id: feels_like_temp
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer-lines"
+    device_class: temperature
+    state_class: measurement
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state() || !id(wind_speed).has_state()) return NAN;
+      float t = id(bme280_temperature).state;
+      float h = id(bme280_humidity).state;
+      float v = id(wind_speed).state;
+      if (t <= 10.0f && v >= 4.8f)
+        return 13.12f + (0.6215f*t) - (11.37f*pow(v,0.16f)) + (0.3965f*t*pow(v,0.16f));
+      if (t >= 26.0f && h >= 40.0f) {
+        float hi = -8.785f + 1.611f*t + 2.339f*h - 0.146f*t*h
+                   - 0.013f*t*t - 0.016f*h*h + 0.002f*t*t*h
+                   + 0.001f*t*h*h - 0.000004f*t*t*h*h;
+        return max(hi, t);
+      }
+      return t;
+
+  - platform: template
+    name: "UV Index"
+    id: uv_index_calc
+    unit_of_measurement: "UVI"
+    accuracy_decimals: 1
+    icon: "mdi:sun-wireless"
+    lambda: |-
+      if (!id(uv_raw_data).has_state()) return NAN;
+      float raw = id(uv_raw_data).state;
+      if (raw <= 0.0f) return 0.0f;
+      float uvi = raw / 170.0f;
+      if (uvi > 15.0f) { ESP_LOGW("uv","Nereálny UVI: %.1f",uvi); return NAN; }
+      return uvi;
+
+  - platform: template
+    name: "Úroveň batérie"
+    id: battery_level
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    lambda: |-
+      if (!id(battery_voltage).has_state()) return NAN;
+      float v = id(battery_voltage).state;
+      if (v >= 4.15f) return 100.0f;
+      if (v >= 4.0f)  return 85.0f  + (v - 4.0f)  * 100.0f;
+      if (v >= 3.75f) return 35.0f  + (v - 3.75f) * 200.0f;
+      if (v >= 3.5f)  return 10.0f  + (v - 3.5f)  * 100.0f;
+      if (v >= 3.3f)  return 2.0f   + (v - 3.3f)  * 40.0f;
+      if (v >= ${batt_min_voltage}) return 1.0f;
+      return 0.0f;
+
+  - platform: internal_temperature
+    name: "Teplota CPU"
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: uptime
+    name: "Čas behu"
+    id: uptime_sensor
+    update_interval: 1s
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "WiFi Signál dBm"
+    id: wifi_signal_dbm
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: copy
+    source_id: wifi_signal_dbm
+    name: "Kvalita WiFi"
+    unit_of_measurement: "%"
+    entity_category: diagnostic
+    filters:
+      - lambda: |-
+          if (x <= -100.0f) return 0.0f;
+          if (x >= -50.0f)  return 100.0f;
+          return 2.0f * (x + 100.0f);
+
+  - platform: template
+    name: "Počet bootov"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: 'return (float)id(boot_count);'
+
+  - platform: template
+    name: "WiFi zlyhania (za sebou)"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: 'return (float)id(wifi_fail_count);'
+
+  - platform: template
+    name: "Chyby senzorov"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: 'return (float)id(sensor_error_count);'
+
+binary_sensor:
+  - platform: status
+    name: "Status Stanice"
+
+  - platform: template
+    name: "Detekcia dažďa"
+    id: rain_detection
+    device_class: moisture
+    lambda: |-
+      bool analog = id(rain_sensor_percent).has_state() &&
+                    id(rain_sensor_percent).state > ${rain_moisture_threshold};
+      bool bucket = id(rain_fall_rate).has_state() &&
+                    id(rain_fall_rate).state > 0.5f;  # prah proti náhodným pulzom
+      return analog || bucket;
+    filters:
+      - delayed_on: 5s
+      - delayed_off: 20s
+
+  - platform: template
+    name: "Kritická batéria"
+    id: low_battery
+    device_class: battery
+    lambda: |-
+      if (!id(battery_voltage).has_state()) return false;
+      return id(battery_voltage).state < (${batt_min_voltage} + 0.1f);
+
+  - platform: template
+    name: "Riziko mrazu"
+    id: frost_risk
+    icon: "mdi:snowflake-alert"
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(dew_point).has_state()) return false;
+      return (id(bme280_temperature).state < ${frost_temp_threshold}) && (id(dew_point).state < 0.0f);
+    filters:
+      - delayed_on: 30s
+
+  - platform: template
+    name: "Výstraha: Búrka"
+    id: storm_warning
+    icon: "mdi:weather-lightning-rainy"
+    lambda: 'return id(pressure_trend_value) < ${storm_pressure_drop};'
+    filters:
+      - delayed_on: 60s
+
+  - platform: template
+    name: "Predikcia dažďa (Tlak)"
+    id: rain_prediction
+    icon: "mdi:weather-rainy"
+    lambda: |-
+      if (!id(bme280_pressure).has_state() || !id(bme280_humidity).has_state()) return false;
+      float cur_p = id(bme280_pressure).state;
+      float hum   = id(bme280_humidity).state;
+
+      id(pressure_history)[id(history_index) % 6] = cur_p;
+      id(pressure_time_index)[id(history_index) % 6] = id(boot_count);
+      id(history_index) = (id(history_index) + 1) % 6;
+
+      int valid = 0; float sum = 0.0f;
+      for (int i = 0; i < 6; i++) {
+        if (!isnan(id(pressure_history)[i]) && id(pressure_history)[i] > 800.0f) {
+          sum += id(pressure_history)[i]; valid++;
+        }
+      }
+      if (valid < 2) return false;
+      float avg = sum / valid;
+
+      bool hum_rising = false;
+      if (!isnan(id(prev_humidity)))
+        hum_rising = (hum - id(prev_humidity)) > 2.0f;
+      id(prev_humidity) = hum;
+
+      float trend = id(pressure_trend_value);
+      if (trend < -1.5f && cur_p < avg && hum_rising) return true;
+      if (cur_p < 1000.0f && hum > id(humidity_threshold)) return true;
+      if (trend < ${storm_pressure_drop}) return true;
+      return false;
+
+  - platform: template
+    name: "Chyba I2C senzorov"
+    id: i2c_error_flag
+    device_class: problem
+    entity_category: diagnostic
+    lambda: 'return !id(i2c_initialized);'
+
+text_sensor:
+  - platform: template
+    name: "Odporúčanie oblečenia"
+    id: clothing_recommendation
+    icon: "mdi:hanger"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state()) return std::string("Načítavam...");
+      float t    = id(bme280_temperature).state;
+      float uvi  = id(uv_index_calc).has_state() ? id(uv_index_calc).state : 0.0f;
+      float wind = id(wind_speed).has_state() ? id(wind_speed).state : 0.0f;
+      bool rain  = id(rain_prediction).state || id(rain_detection).state;
+      bool frost = id(frost_risk).state;
+      bool windy = wind > 25.0f;
+      bool highUV = uvi >= 6.0f;
+      if (frost) return std::string("🧊 Pozor na mráz! Protišmykové topánky, rukavice.");
+      if (rain) {
+        if (t < 3)  return std::string("🥶 Ľadový dážď! Zimná bunda, dáždnik, pozor na námrazu!");
+        if (t < 10) return std::string("🌧️ Prší a je zima. Zimná bunda + dáždnik.");
+        if (t < 20) return std::string("🌦️ Prší. Nepremokavá bunda.");
+        return std::string("⛈️ Teplý dážď. Ľahká bunda + dáždnik.");
+      }
+      if (t < -5) return std::string("🧊 Tuhý mráz! Vrstvy, zimná bunda, čiapka, šál, rukavice.");
+      if (t < 5)  return std::string("❄️ Mráz! Zimná bunda, čiapka, rukavice.");
+      if (t < 15) {
+        if (windy) return std::string("💨 Chladno a veterno. Vetrovka + sveter.");
+        return std::string("🧥 Chladno. Sveter a bunda.");
+      }
+      if (t < 22) return std::string("👕 Príjemne. Mikina alebo tričko.");
+      if (t < 30) {
+        if (highUV) return std::string("☀️ Teplo + silné UV! Tričko, opaľovací krém SPF50+, klobúk.");
+        return std::string("☀️ Teplo. Tričko, nezabudni na opaľovací krém.");
+      }
+      return std::string("🔥 Horúčava! Naľahko, veľa pitia, hľadaj tieň.");
+
+  - platform: template
+    name: "Smer vetra (Text)"
+    id: wind_dir_text
+    update_interval: never
+    lambda: |-
+      if (!id(wind_direction_angle).has_state()) return std::string("N/A");
+      float angle = id(wind_direction_angle).state;
+      if (isnan(angle)) return std::string("Bezvetrie");
+      const char* dirs[] = {"S","SSV","SV","VSV","V","VJV","JV","JJV","J","JJZ","JZ","ZJZ","Z","ZSZ","SZ","SSZ"};
+      return std::string(dirs[(int)((angle + 11.25f) / 22.5f) % 16]);
+
+  - platform: template
+    name: "Sila vetra (Beaufort)"
+    id: wind_beaufort_text
+    icon: "mdi:weather-windy"
+    update_interval: never
+    lambda: |-
+      if (!id(wind_speed).has_state()) return std::string("N/A");
+      float v = id(wind_speed).state;
+      if (v < 1.0f)  return std::string("0 – Ticho");
+      if (v < 5.0f)  return std::string("1 – Slabý vánek");
+      if (v < 12.0f) return std::string("2-3 – Ľahký vietor");
+      if (v < 20.0f) return std::string("4 – Mierny vietor");
+      if (v < 29.0f) return std::string("5 – Čerstvý vietor");
+      if (v < 39.0f) return std::string("6 – Silný vietor");
+      if (v < 50.0f) return std::string("7 – Mierny štor");
+      if (v < 62.0f) return std::string("8 – Čerstvý štor");
+      if (v < 75.0f) return std::string("9 – Silný štor");
+      return std::string("10+ – BÚRKA ⚠️");
+
+  - platform: template
+    name: "Intenzita zrážok (Text)"
+    id: rain_intensity_text
+    icon: "mdi:weather-pouring"
+    update_interval: never
+    lambda: |-
+      if (!id(rain_fall_rate).has_state() || !id(rain_detection).state) return std::string("Bez dažďa");
+      float r = id(rain_fall_rate).state;
+      if (r < 2.5f)  return std::string("🌂 Mrholenie");
+      if (r < 7.5f)  return std::string("🌧️ Ľahký dážď");
+      if (r < 15.0f) return std::string("🌧️ Mierny dážď");
+      if (r < 30.0f) return std::string("⛈️ Silný dážď");
+      return std::string("⛈️ PRÍVALOVÝ DÁŽĎ ⚠️");
+
+  - platform: template
+    name: "Predpoveď počasia"
+    id: weather_forecast_text
+    icon: "mdi:weather-partly-cloudy"
+    update_interval: never
+    lambda: |-
+      bool storm  = id(storm_warning).state;
+      bool rain_p = id(rain_prediction).state;
+      bool rain_d = id(rain_detection).state;
+      bool frost  = id(frost_risk).state;
+      float trend = id(pressure_trend_value);
+      float uvi   = id(uv_index_calc).has_state() ? id(uv_index_calc).state : 0.0f;
+      float t     = id(bme280_temperature).has_state() ? id(bme280_temperature).state : NAN;
+      if (storm)  return std::string("⛈️ Búrka! Rýchly pokles tlaku.");
+      if (rain_d) return std::string("🌧️ Momentálne prší.");
+      if (rain_p) return std::string("🌦️ Predpoveď: Možný dážď.");
+      if (frost)  return std::string("🧊 Hrozí mráz — pozor na poľadovicu.");
+      if (!isnan(t)) {
+        if (trend > 1.0f) {
+          if (uvi >= 6.0f) return std::string("☀️ Vyjasňuje sa, silné UV žiarenie.");
+          return std::string("⛅ Vyjasňuje sa.");
+        }
+        if (trend < -1.0f) return std::string("🌤️ Zhoršovanie počasia.");
+        if (uvi >= 3.0f)   return std::string("☀️ Jasno, stabilný tlak.");
+      }
+      return std::string("🌡️ Stabilné počasie.");
+
+  - platform: template
+    name: "Režim stanice"
+    id: station_mode_text
+    icon: "mdi:sleep"
+    entity_category: diagnostic
+    lambda: |-
+      switch(id(last_sleep_mode)) {
+        case 1: return std::string("⛈️ STORM (2 min)");
+        case 2: return std::string("🔋 ECO (30 min)");
+        case 3: return std::string("🚀 PERF (5 min)");
+        default: return std::string("🔄 Normal (10 min)");
+      }
+
+output:
+  - platform: gpio
+    pin: GPIO18
+    id: rain_sensor_power
+  - platform: gpio
+    pin: GPIO19
+    id: i2c_sensor_power
+
+switch:
+  - platform: template
+    name: "Manuálne napájanie senzorov"
+    optimistic: true
+    entity_category: config
+    turn_on_action:
+      - output.turn_on: rain_sensor_power
+      - output.turn_on: i2c_sensor_power
+    turn_off_action:
+      - output.turn_off: rain_sensor_power
+      - output.turn_off: i2c_sensor_power
+
+  - platform: template
+    name: "Vynútiť Deep Sleep"
+    icon: "mdi:sleep"
+    entity_category: config
+    turn_on_action:
+      - deep_sleep.enter: deep_sleep_control
+
+  - platform: restart
+    name: "Reštartovať Stanicu"
+    entity_category: config
+
+  - platform: template
+    name: "Reset diagnostiky"
+    icon: "mdi:restore"
+    entity_category: config
+    turn_on_action:
+      - lambda: |-
+          id(sensor_error_count) = 0;
+          id(wifi_fail_count) = 0;
+          id(i2c_restart_attempts) = 0;
+          ESP_LOGI("diag", "Diagnostické počítadlá resetované.");
+
+number:
+  - platform: template
+    name: "Prah poklesu tlaku"
+    id: pressure_threshold_config
+    unit_of_measurement: "hPa"
+    min_value: -5.0
+    max_value: 0.0
+    step: 0.1
+    initial_value: -0.3
+    optimistic: true
+    entity_category: config
+    set_action:
+      - lambda: 'id(pressure_threshold) = x;'
+
+  - platform: template
+    name: "Prah vlhkosti pre dážď"
+    id: humidity_threshold_config
+    unit_of_measurement: "%"
+    min_value: 60.0
+    max_value: 95.0
+    step: 1.0
+    initial_value: 80.0
+    optimistic: true
+    entity_category: config
+    set_action:
+      - lambda: 'id(humidity_threshold) = x;'
+
+deep_sleep:
+  id: deep_sleep_control
+
+script:
+  - id: failsafe_guard
+    mode: restart
+    then:
+      - delay: ${sleep_failsafe}
+      - logger.log:
+          level: ERROR
+          tag: "failsafe"
+          format: "Failsafe! Boot #%d → Núdzový spánok 10 min."
+          args: ['id(boot_count)']
+      - output.turn_off: rain_sensor_power
+      - output.turn_off: i2c_sensor_power
+      - lambda: 'id(sensor_error_count) += 1;'
+      - deep_sleep.enter:
+          id: deep_sleep_control
+          sleep_duration: 10min
+
+  - id: init_i2c_sensors
+    mode: single
+    then:
+      - lambda: |-
+          id(i2c_initialized) = false;
+          id(i2c_restart_attempts) = 0;
+      - script.execute: check_bme280_chip
+      - delay: 200ms
+      - if:
+          condition:
+            lambda: 'return id(i2c_initialized);'
+          then:
+            - logger.log:
+                level: INFO
+                tag: "i2c"
+                format: "I2C inicializácia OK."
+          else:
+            - logger.log:
+                level: WARN
+                tag: "i2c"
+                format: "I2C zlyhalo → Power cycle..."
+            - output.turn_off: i2c_sensor_power
+            - delay: 500ms
+            - output.turn_on: i2c_sensor_power
+            - delay: 2000ms
+            - script.execute: check_bme280_chip
+            - delay: 200ms
+            - if:
+                condition:
+                  lambda: 'return id(i2c_initialized);'
+                then:
+                  - logger.log:
+                      level: INFO
+                      tag: "i2c"
+                      format: "I2C OK po power cycle."
+                else:
+                  - logger.log:
+                      level: ERROR
+                      tag: "i2c"
+                      format: "I2C NEDOSTUPNÉ! Stanica pobeží bez BME280."
+                  - lambda: 'id(sensor_error_count) += 1;'
+
+  - id: wifi_connect_logic
+    then:
+      - wait_until:
+          condition: wifi.connected
+          timeout: 15s
+      - if:
+          condition: wifi.connected
+          then:
+            - wait_until:
+                condition:
+                  api.connected:
+                timeout: 10s
+            - if:
+                condition: api.connected
+                then:
+                  - script.execute: read_all_sensors
+                  - delay: 3s
+                  - script.execute: check_and_enter_deep_sleep
+                else:
+                  - logger.log:
+                      level: WARN
+                      tag: "wifi"
+                      format: "API nedostupné → Spím 5 min."
+                  - lambda: 'id(wifi_fail_count) += 1;'
+                  - deep_sleep.enter:
+                      id: deep_sleep_control
+                      sleep_duration: 5min
+          else:
+            - lambda: 'id(wifi_fail_count) += 1;'
+            - logger.log:
+                level: WARN
+                tag: "wifi"
+                format: "WiFi zlyhalo (pokus #%d)."
+                args: ['id(wifi_fail_count)']
+            - if:
+                condition:
+                  lambda: 'return id(wifi_fail_count) >= 5;'
+                then:
+                  - logger.log:
+                      level: ERROR
+                      tag: "wifi"
+                      format: "5× WiFi zlyhalo → Spím 30 min."
+                  - deep_sleep.enter:
+                      id: deep_sleep_control
+                      sleep_duration: 30min
+                else:
+                  - deep_sleep.enter:
+                      id: deep_sleep_control
+                      sleep_duration: 5min
+
+  - id: read_all_sensors
+    then:
+      - if:
+          condition:
+            lambda: 'return id(i2c_initialized);'
+          then:
+            - component.update: bme280_sensor
+            - component.update: ltr390_sensor
+          else:
+            - logger.log:
+                level: WARN
+                tag: "sensors"
+                format: "I2C nie je OK, preskakujem BME280/LTR390."
+      - component.update: battery_voltage
+      - component.update: rain_sensor_voltage
+      - component.update: wifi_signal_dbm
+      - delay: 200ms
+      - component.update: rain_sensor_percent
+      - component.update: dew_point
+      - component.update: absolute_humidity
+      - component.update: comfort_index
+      - component.update: feels_like_temp
+      - component.update: uv_index_calc
+      - component.update: battery_level
+      - component.update: wind_dir_text
+      - component.update: wind_beaufort_text
+      - component.update: rain_intensity_text
+      - component.update: clothing_recommendation
+      - component.update: weather_forecast_text
+      - component.update: station_mode_text
+      - component.update: pressure_trend_sensor
+
+  - id: uspat_ltr390
+    then:
+      - lambda: |-
+          uint8_t cmd[] = {0x00, 0x00};
+          if (id(busa).write(0x53, cmd, 2) != esphome::i2c::ERROR_OK)
+            ESP_LOGW("ltr390", "Nepodarilo sa uspať LTR390");
+
+  - id: check_bme280_chip
+    then:
+      - lambda: |-
+          if (id(busa).write(0x76, nullptr, 0) != esphome::i2c::ERROR_OK) {
+            ESP_LOGE("boot", "BME280 nenájdený na 0x76!");
+            id(i2c_initialized) = false;
+            return;
+          }
+          uint8_t reg = 0xD0, chip_id = 0;
+          if (id(busa).write(0x76, &reg, 1) == esphome::i2c::ERROR_OK &&
+              id(busa).read(0x76, &chip_id, 1) == esphome::i2c::ERROR_OK) {
+            if (chip_id == 0x60) {
+              ESP_LOGI("boot", "BME280 OK (ID: 0x60)");
+              id(i2c_initialized) = true;
+            } else if (chip_id == 0x58) {
+              ESP_LOGW("boot", "BMP280 namiesto BME280 — vlhkosť nebude.");
+              id(i2c_initialized) = true;
+            } else {
+              ESP_LOGW("boot", "Neznámy chip 0x%02X", chip_id);
+              id(i2c_initialized) = false;
+            }
+          } else {
+            ESP_LOGE("boot", "Nepodarilo sa prečítať chip ID");
+            id(i2c_initialized) = false;
+          }
+
+  - id: update_pressure_trend
+    mode: single
+    then:
+      - lambda: |-
+          float sum_x=0,sum_y=0,sum_xx=0,sum_xy=0;
+          int n=0;
+          float avg_s = id(last_sleep_duration_s);
+          for (int i=0; i<6; i++) {
+            float p = id(pressure_history)[i];
+            int   t = id(pressure_time_index)[i];
+            if (!isnan(p) && p > 800.0f && t > 0) {
+              float x = (float)t * avg_s / 3600.0f;
+              sum_x+=x; sum_y+=p; sum_xx+=x*x; sum_xy+=x*p; n++;
+            }
+          }
+          if (n < 2) { id(pressure_trend_value) = 0.0f; return; }
+          float denom = n*sum_xx - sum_x*sum_x;
+          if (abs(denom) < 0.0001f) { id(pressure_trend_value) = 0.0f; return; }
+          id(pressure_trend_value) = clamp((n*sum_xy - sum_x*sum_y)/denom, -10.0f, 10.0f);
+          ESP_LOGD("pressure","Trend: %.2f hPa/h (n=%d)", id(pressure_trend_value), n);
+
+  - id: check_and_enter_deep_sleep
+    mode: single
+    then:
+      - lambda: |-
+          float bat   = id(battery_level).has_state() ? id(battery_level).state : 50.0f;
+          bool  rain  = id(rain_detection).state;
+          bool  rain_p = id(rain_prediction).state;
+          bool  storm = id(storm_warning).state;
+          float wind  = id(wind_speed).has_state() ? id(wind_speed).state : 0.0f;
+
+          uint32_t sleep_ms = ${sleep_normal_mode_ms};
+          int mode_id = 0;
+
+          if (bat < ${bat_eco_threshold}) {
+            sleep_ms = ${sleep_eco_mode_ms}; mode_id = 2;
+          } else if (storm && bat > ${bat_storm_min}) {
+            sleep_ms = ${sleep_storm_mode_ms}; mode_id = 1;
+          } else if ((rain || rain_p || wind > ${wind_storm_threshold}) && bat > ${bat_storm_min}) {
+            sleep_ms = ${sleep_storm_mode_ms}; mode_id = 1;
+          } else if (bat > ${bat_perf_threshold}) {
+            sleep_ms = ${sleep_perf_mode_ms}; mode_id = 3;
+          }
+
+          id(last_sleep_duration_s) = (float)sleep_ms / 1000.0f;
+          id(last_sleep_mode) = mode_id;
+
+          const char* names[] = {"Normal","STORM","ECO","PERF"};
+          ESP_LOGI("sleep","Režim: %s | %us | Bat: %.0f%% | Wind: %.1fkm/h | Rain:%s Storm:%s",
+            names[mode_id], sleep_ms/1000, bat, wind,
+            rain?"YES":"NO", storm?"YES":"NO");
+
+          id(deep_sleep_control).set_sleep_duration(sleep_ms);
+      - deep_sleep.enter: deep_sleep_control
+
+  - id: periodic_sleep_check
+    mode: single
+    then:
+      - if:
+          condition:
+            not:
+              api.connected:
+          then:
+            - script.execute: check_and_enter_deep_sleep
+
+interval:
+  - interval: 15s
+    then:
+      - script.execute: periodic_sleep_check
