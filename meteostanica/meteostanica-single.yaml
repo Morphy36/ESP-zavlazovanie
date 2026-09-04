@@ -845,7 +845,7 @@ sensor:
     update_interval: never
 
   - platform: wifi_signal
-    name: "WiFi signál"
+    name: "WiFi Signál dBm"
     id: wifi_signal_dbm
     entity_category: diagnostic
     update_interval: never
@@ -890,7 +890,7 @@ sensor:
     lambda: 'return (float) id(wifi_fail_count);'
 
   - platform: template
-    name: "Chyby senzorov (za sebou)"
+    name: "Chyby senzorov"
     id: sensor_error_sensor
     accuracy_decimals: 0
     state_class: measurement
@@ -1230,7 +1230,7 @@ number:
   # takže prežijú deep sleep aj bez týchto entít. initial_value tu musí sedieť
   # s initial_value danej globálky.
   - platform: template
-    name: "Prah trendu tlaku (predikcia dažďa)"
+    name: "Prah trendu tlaku"
     id: rain_trend_threshold_config
     unit_of_measurement: "hPa/h"
     min_value: -5.0

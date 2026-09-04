@@ -189,6 +189,21 @@ Stav prepínača prežije deep sleep (`restore_mode: RESTORE_DEFAULT_OFF`).
 
 ---
 
+## Dashboard v Home Assistante
+
+`homeassistant/build_dashboard.py` vytvorí dashboard **Meteostanica** na
+`/meteo-stanica` (Prehľad · Grafy · Stanica). Detaily v
+[homeassistant/README.md](homeassistant/README.md).
+
+```bash
+cd homeassistant && python3 build_dashboard.py
+```
+
+Entity majú v HA prefix `meteostanica_vonku_1_` podľa názvu zariadenia
+*MeteoStanica - Vonku 1*, nie podľa `dev_name`.
+
+---
+
 ## Tipy pre Home Assistant
 
 Denné a mesačné úhrny zrážok rieš cez `utility_meter` nad entitou

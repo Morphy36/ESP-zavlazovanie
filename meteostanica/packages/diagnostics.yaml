@@ -24,7 +24,7 @@ sensor:
     update_interval: never
 
   - platform: wifi_signal
-    name: "WiFi signál"
+    name: "WiFi Signál dBm"
     id: wifi_signal_dbm
     entity_category: diagnostic
     update_interval: never
@@ -69,7 +69,7 @@ sensor:
     lambda: 'return (float) id(wifi_fail_count);'
 
   - platform: template
-    name: "Chyby senzorov (za sebou)"
+    name: "Chyby senzorov"
     id: sensor_error_sensor
     accuracy_decimals: 0
     state_class: measurement

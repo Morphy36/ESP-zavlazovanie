@@ -88,7 +88,7 @@ number:
   # takže prežijú deep sleep aj bez týchto entít. initial_value tu musí sedieť
   # s initial_value danej globálky.
   - platform: template
-    name: "Prah trendu tlaku (predikcia dažďa)"
+    name: "Prah trendu tlaku"
     id: rain_trend_threshold_config
     unit_of_measurement: "hPa/h"
     min_value: -5.0
