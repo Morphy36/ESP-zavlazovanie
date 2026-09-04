@@ -18,6 +18,8 @@ dažďa, výstrahu na búrku a mráz, Beaufortovu stupnicu, odporúčanie obleč
 ```
 meteostanica/
 ├── meteostanica.yaml          # hlavný súbor: LEN substitúcie + zoznam balíčkov
+├── meteostanica-single.yaml   # vygenerovaná jednosúborová verzia (na nahratie)
+├── build_single_file.py       # generátor jednosúborovej verzie
 ├── secrets.yaml.example       # šablóna, skopíruj na secrets.yaml
 └── packages/
     ├── core.yaml              # boot sekvencia, logger, globálne premenné
@@ -38,29 +40,77 @@ potrebné siahať pri bežnom ladení.
 
 ---
 
-## Inštalácia
+## Nahratie do ESPHome
+
+Sú dve rovnocenné možnosti — obidve robia presne to isté, líšia sa len tým,
+koľko súborov musíš prekopírovať.
+
+### A) Jeden súbor (najjednoduchšie)
+
+`meteostanica-single.yaml` je celá konfigurácia zliata do jedného súboru.
+V ESPHome dashboarde daj **+ NEW DEVICE → Skip → Continue**, potom
+**EDIT** a obsah nahraď týmto súborom. Alebo ho jednoducho skopíruj do
+`/config/esphome/`.
+
+### B) Modulárne (na ďalšie ladenie)
+
+Skopíruj `meteostanica.yaml` **aj celý adresár `packages/`** do
+`/config/esphome/`. Podadresár dashboardu neprekáža — ako zariadenie zobrazuje
+len `.yaml` súbory na najvyššej úrovni.
+
+```
+/config/esphome/
+├── meteostanica.yaml
+├── secrets.yaml
+└── packages/          ← všetkých 10 súborov
+```
+
+> Zdrojom pravdy je modulárna verzia. Po zmene v `packages/` regeneruj jeden
+> súbor cez `python3 build_single_file.py` — generátor overuje, že sa žiadny
+> neznámy kľúč nestratí.
+
+### Secrets
+
+Obe verzie potrebujú `secrets.yaml`. V HA add-one naň slúži tlačidlo
+**SECRETS** vpravo hore; z CLI:
 
 ```bash
 cp secrets.yaml.example secrets.yaml
 ```
 
-Vyplň `secrets.yaml` (WiFi, IP, API kľúč, OTA heslo). API kľúč vygeneruješ:
+Potrebných je týchto 9 položiek — ak už nejaký `secrets.yaml` máš, len doplň
+chýbajúce:
+
+```
+wifi_ssid  wifi_password
+meteo_static_ip  network_gateway  network_subnet  network_dns
+ap_password  api_encryption_key  ota_password
+```
+
+API kľúč vygeneruješ:
 
 ```bash
 python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
 ```
 
-Skontroluj konfiguráciu bez kompilácie:
+### Postup
 
-```bash
-esphome config meteostanica.yaml
-```
+1. **Najprv validuj**, nekompiluj naslepo — v dashboarde tlačidlo
+   **Validate**, z CLI `esphome config meteostanica.yaml`.
+2. **Prvý flash musí ísť cez USB.** Pribudlo API šifrovanie a OTA heslo, takže
+   bežiaci firmvér v2.x sa po sieti aktualizovať nedá.
+3. Ďalšie aktualizácie už idú OTA — pozri sekciu *OTA aktualizácia* nižšie.
 
-Skompiluj a nahraj (prvýkrát cez USB):
+### Po nahratí v Home Assistante
 
-```bash
-esphome run meteostanica.yaml
-```
+- **HA si vypýta nový API kľúč** — integráciu ESPHome treba znovu nakonfigurovať
+  hodnotou `api_encryption_key` zo `secrets.yaml`.
+- **Časť entít dostane nové `entity_id`** a stratí históriu, lebo sa zmenil
+  názov alebo doména: „Rýchlosť vetra (Priemer)" → „Rýchlosť vetra",
+  „WiFi Signál dBm" → „WiFi signál", „Chyba I2C senzorov" → „Chyba senzorov",
+  a hlavne **„Vynútiť Deep Sleep" a „Reset diagnostiky" sú teraz `button`,
+  nie `switch`**. Staré entity ostanú ako nedostupné — zmaž ich ručne.
+- **Počítadlo zrážok začne od nuly** (`rain_tips_total` je nová premenná).
 
 > `secrets.yaml` je v `.gitignore`. Nikdy ho necommituj.
 
