@@ -1,0 +1,140 @@
+# =============================================================================
+#  TEXTOVÉ SENZORY — ľudsky čitateľné zhrnutia pre dashboard
+# =============================================================================
+
+text_sensor:
+  # --- Smer vetra slovom -----------------------------------------------------
+  - platform: template
+    name: "Smer vetra (Text)"
+    id: wind_dir_text
+    icon: "mdi:compass"
+    update_interval: never
+    lambda: |-
+      if (!id(wind_direction_angle).has_state()) return std::string("N/A");
+      float angle = id(wind_direction_angle).state;
+      if (isnan(angle)) return std::string("Bezvetrie");
+      static const char *const DIRS[] = {
+        "S", "SSV", "SV", "VSV", "V", "VJV", "JV", "JJV",
+        "J", "JJZ", "JZ", "ZJZ", "Z", "ZSZ", "SZ", "SSZ"
+      };
+      int idx = (int) ((angle + 11.25f) / 22.5f) % 16;
+      if (idx < 0) idx += 16;
+      return std::string(DIRS[idx]);
+
+  # --- Beaufortova stupnica --------------------------------------------------
+  - platform: template
+    name: "Sila vetra (Beaufort)"
+    id: wind_beaufort_text
+    icon: "mdi:weather-windy"
+    update_interval: never
+    # OPRAVA v2.x: hranice boli posunuté o jeden stupeň (12–19 km/h je B3,
+    # nie B4). Nižšie sú oficiálne hranice stupnice v km/h.
+    lambda: |-
+      if (!id(wind_speed).has_state()) return std::string("N/A");
+      float v = id(wind_speed).state;
+      if (v <   1.0f) return std::string("0 – Bezvetrie");
+      if (v <   6.0f) return std::string("1 – Vánok");
+      if (v <  12.0f) return std::string("2 – Slabý vietor");
+      if (v <  20.0f) return std::string("3 – Mierny vietor");
+      if (v <  29.0f) return std::string("4 – Dosť čerstvý vietor");
+      if (v <  39.0f) return std::string("5 – Čerstvý vietor");
+      if (v <  50.0f) return std::string("6 – Silný vietor");
+      if (v <  62.0f) return std::string("7 – Mierny víchor");
+      if (v <  75.0f) return std::string("8 – Čerstvý víchor");
+      if (v <  89.0f) return std::string("9 – Silný víchor");
+      if (v < 103.0f) return std::string("10 – Víchrica ⚠️");
+      if (v < 118.0f) return std::string("11 – Mohutná víchrica ⚠️");
+      return std::string("12 – Orkán ⚠️");
+
+  # --- Intenzita zrážok slovom ----------------------------------------------
+  - platform: template
+    name: "Intenzita zrážok (Text)"
+    id: rain_intensity_text
+    icon: "mdi:weather-pouring"
+    update_interval: never
+    lambda: |-
+      if (!id(rain_detection).state) return std::string("Bez dažďa");
+      if (!id(rain_fall_rate).has_state() || isnan(id(rain_fall_rate).state))
+        return std::string("Prší");
+      float r = id(rain_fall_rate).state;
+      if (r <  2.5f) return std::string("🌂 Mrholenie");
+      if (r <  7.5f) return std::string("🌧️ Ľahký dážď");
+      if (r < 15.0f) return std::string("🌧️ Mierny dážď");
+      if (r < 30.0f) return std::string("⛈️ Silný dážď");
+      return std::string("⛈️ PRÍVALOVÝ DÁŽĎ ⚠️");
+
+  # --- Odporúčanie oblečenia -------------------------------------------------
+  - platform: template
+    name: "Odporúčanie oblečenia"
+    id: clothing_recommendation
+    icon: "mdi:hanger"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state()) return std::string("Načítavam...");
+      float t    = id(bme280_temperature).state;
+      float uvi  = id(uv_index_sensor).has_state() ? id(uv_index_sensor).state : 0.0f;
+      float wind = id(wind_speed).has_state() ? id(wind_speed).state : 0.0f;
+      bool rain   = id(rain_prediction).state || id(rain_detection).state;
+      bool frost  = id(frost_risk).state;
+      bool windy  = wind > 25.0f;
+      bool highUV = uvi >= 6.0f;
+
+      if (frost) return std::string("🧊 Pozor na mráz! Protišmykové topánky, rukavice.");
+      if (rain) {
+        if (t <  3.0f) return std::string("🥶 Ľadový dážď! Zimná bunda, dáždnik, pozor na námrazu!");
+        if (t < 10.0f) return std::string("🌧️ Prší a je zima. Zimná bunda + dáždnik.");
+        if (t < 20.0f) return std::string("🌦️ Prší. Nepremokavá bunda.");
+        return std::string("⛈️ Teplý dážď. Ľahká bunda + dáždnik.");
+      }
+      if (t < -5.0f) return std::string("🧊 Tuhý mráz! Vrstvy, zimná bunda, čiapka, šál, rukavice.");
+      if (t <  5.0f) return std::string("❄️ Mráz! Zimná bunda, čiapka, rukavice.");
+      if (t < 15.0f) {
+        if (windy) return std::string("💨 Chladno a veterno. Vetrovka + sveter.");
+        return std::string("🧥 Chladno. Sveter a bunda.");
+      }
+      if (t < 22.0f) return std::string("👕 Príjemne. Mikina alebo tričko.");
+      if (t < 30.0f) {
+        if (highUV) return std::string("☀️ Teplo + silné UV! Tričko, opaľovací krém SPF50+, klobúk.");
+        return std::string("☀️ Teplo. Tričko, nezabudni na opaľovací krém.");
+      }
+      return std::string("🔥 Horúčava! Naľahko, veľa pitia, hľadaj tieň.");
+
+  # --- Krátka predpoveď ------------------------------------------------------
+  - platform: template
+    name: "Predpoveď počasia"
+    id: weather_forecast_text
+    icon: "mdi:weather-partly-cloudy"
+    update_interval: never
+    lambda: |-
+      float trend = id(pressure_trend_value);
+      float uvi   = id(uv_index_sensor).has_state() ? id(uv_index_sensor).state : 0.0f;
+
+      if (id(storm_warning).state)   return std::string("⛈️ Búrka! Rýchly pokles tlaku.");
+      if (id(rain_detection).state)  return std::string("🌧️ Momentálne prší.");
+      if (id(rain_prediction).state) return std::string("🌦️ Predpoveď: Možný dážď.");
+      if (id(frost_risk).state)      return std::string("🧊 Hrozí mráz — pozor na poľadovicu.");
+
+      if (id(bme280_temperature).has_state()) {
+        if (trend > 1.0f) {
+          if (uvi >= 6.0f) return std::string("☀️ Vyjasňuje sa, silné UV žiarenie.");
+          return std::string("⛅ Vyjasňuje sa.");
+        }
+        if (trend < -1.0f) return std::string("🌤️ Zhoršovanie počasia.");
+        if (uvi >= 3.0f)   return std::string("☀️ Jasno, stabilný tlak.");
+      }
+      return std::string("🌡️ Stabilné počasie.");
+
+  # --- Aktuálny režim spánku -------------------------------------------------
+  - platform: template
+    name: "Režim stanice"
+    id: station_mode_text
+    icon: "mdi:sleep"
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      switch (id(last_sleep_mode)) {
+        case 1:  return std::string("⛈️ STORM (2 min)");
+        case 2:  return std::string("🔋 ECO (30 min)");
+        case 3:  return std::string("🚀 PERF (5 min)");
+        default: return std::string("🔄 Normal (10 min)");
+      }

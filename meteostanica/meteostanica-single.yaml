@@ -1,0 +1,1576 @@
+# ===========================================================================
+#  VONKAJŠIA METEOSTANICA — ESPHome v3.0.0 (jednosúborová verzia)
+# ===========================================================================
+#
+#  AUTOMATICKY VYGENEROVANÉ — needituj tento súbor.
+#  Zdroj: meteostanica.yaml + packages/*.yaml
+#  Regenerácia: python3 build_single_file.py
+#
+#  Do ESPHome dashboardu stačí prekopírovať tento jeden súbor a mať
+#  vyplnený secrets.yaml (šablóna je v secrets.yaml.example).
+# ===========================================================================
+
+substitutions:
+  # --- Identita zariadenia ---------------------------------------------------
+  dev_name: "vonkajsia-stanica"
+  friendly_name: "Vonkajšia Meteostanica"
+
+  # --- Umiestnenie -----------------------------------------------------------
+  altitude_meters: "250"          # nadmorská výška [m] pre prepočet tlaku na MSL
+
+  # --- Piny (pozri tabuľku zapojenia v README.md) ----------------------------
+  pin_sda: "GPIO22"
+  pin_scl: "GPIO21"
+  pin_battery: "GPIO35"           # ADC1 – delič napätia batérie
+  pin_rain_analog: "GPIO34"       # ADC1 – analógový dažďový senzor (doštička)
+  pin_wind_vane: "GPIO33"         # ADC1 – korouhvička (smer vetra)
+  pin_wind_speed: "GPIO25"        # RTC GPIO – anemometer (jazýčkový kontakt)
+  pin_rain_bucket: "GPIO26"       # RTC GPIO – zrážkomer (preklopná nádobka)
+  pin_rain_power: "GPIO18"        # napájanie analógového dažďového senzora
+  pin_i2c_power: "GPIO19"         # napájanie I2C vetvy (BME280 + LTR390)
+
+  # --- Napájanie senzorov ----------------------------------------------------
+  # Blokujúce čakanie po zapnutí railu, ešte PRED setup() I2C komponentov.
+  # BME280 t_startup = 2 ms, LTR390 potrebuje ~100 ms.
+  sensor_power_settle_ms: "120"
+
+  # --- Batéria ---------------------------------------------------------------
+  batt_multiplier: "2.0"          # pomer deliča (2× 100 kΩ => 2.0)
+  batt_min_voltage: "3.0"
+
+  # --- Časy spánku (adaptívny režim) -----------------------------------------
+  sleep_default: "10min"          # BEZPEČNÝ default pre deep_sleep komponent
+  sleep_storm_mode_ms: "120000"   # 2 min  – dážď / vietor / búrka
+  sleep_normal_mode_ms: "600000"  # 10 min – bežná prevádzka
+  sleep_eco_mode_ms: "1800000"    # 30 min – slabá batéria
+  sleep_perf_mode_ms: "300000"    # 5 min  – plná batéria
+  sleep_failsafe: "4min"          # ak cyklus zamrzne, po tomto čase núdzový spánok
+  sleep_no_wifi_ms: "300000"      # 5 min – WiFi alebo API nedostupné
+  sleep_wifi_dead_ms: "1800000"   # 30 min – po `wifi_fail_limit` neúspechoch
+  wifi_fail_limit: "5"
+
+  # --- Okno bdenia -----------------------------------------------------------
+  wifi_wait_timeout: "15s"
+  api_wait_timeout: "10s"
+  publish_flush_delay: "600ms"    # čas na odoslanie stavov do HA pred spánkom
+  wifi_ap_timeout: "1min"
+  wifi_tx_power: "8.5dBm"
+
+  # --- Kalibrácia dažďového senzora (analógová doštička) ---------------------
+  rain_calib_dry: "1.033"         # napätie na suchu [V]
+  rain_calib_wet: "0.419"         # napätie pri úplnom zmáčaní [V]
+
+  # --- Anemometer a zrážkomer ------------------------------------------------
+  wind_pulse_to_kmh: "0.04"       # pulzy/min -> km/h (1 ot./s = 2.4 km/h)
+  wind_sample_interval: "3s"
+  wind_debounce: "5ms"            # zákmity jazýčka; 5 ms => strop cca 240 km/h
+  wind_calm_threshold: "0.3"      # pod touto rýchlosťou hlásime bezvetrie
+  rain_mm_per_tip: "0.2794"       # objem jednej preklopnej nádobky [mm]
+  rain_sample_interval: "5s"
+  rain_debounce: "200ms"          # preklopenie je pomalé, filtrujeme naozaj tvrdo
+
+  # --- Korouhvička -----------------------------------------------------------
+  wind_pullup_res: "10000"        # odpor voči GND [Ω]
+  wind_vane_tolerance: "0.15"     # max. relatívna odchýlka od tabuľkového odporu
+
+  # --- UV --------------------------------------------------------------------
+  uv_window_factor: "1.0"         # >1.0 ak je senzor za sklom/plexi
+
+  # --- Prahy -----------------------------------------------------------------
+  wind_storm_threshold: "15.0"    # km/h – nad tým prepni na častejšie meranie
+  bat_eco_threshold: "20.0"       # %
+  bat_storm_min: "30.0"           # %
+  bat_perf_threshold: "80.0"      # %
+  rain_moisture_threshold: "15.0" # % vlhkosti analógovej doštičky
+  frost_temp_threshold: "3.0"     # °C
+  storm_pressure_drop: "-2.5"     # hPa/h
+
+  # --- História tlaku --------------------------------------------------------
+  # POZOR: pri zmene je nutné upraviť aj initial_value v packages/core.yaml!
+  press_hist_size: "8"
+
+  # --- Logovanie -------------------------------------------------------------
+  # INFO počas ladenia deep sleepu, WARN v bežnej prevádzke.
+  log_level: "INFO"
+
+
+# ===========================================================================
+#  ESPHOME
+# ===========================================================================
+esphome:
+  # ── packages/core.yaml ───────────────────────────────────────────────
+  # CORE — základ zariadenia, boot sekvencia, globálne premenné
+  name: ${dev_name}
+  friendly_name: ${friendly_name}
+  comment: "Solárna meteostanica s adaptívnym deep sleep"
+  project:
+    name: "morphy.meteostanica"
+    version: "3.0.0"
+
+  on_boot:
+    # -------------------------------------------------------------------------
+    # FÁZA 1 — priorita 750
+    #
+    # Prečo práve 750: ESPHome inicializuje komponenty od najvyššej priority.
+    #   800 = HARDWARE  -> GPIO výstupy a `globals` s restore_value
+    #   600 = DATA      -> I2C senzory (BME280, LTR390)
+    # Pri 750 sú teda globals už obnovené z RTC pamäte a GPIO výstupy funkčné,
+    # ale I2C senzory ešte nebežali setup(). Zapneme im napájanie práve tu, takže
+    # ich vlastný setup() už prebehne na napájanom zariadení — a nie je potrebný
+    # žiadny manuálny I2C "recovery"/power-cycle ako vo v2.x.
+    # -------------------------------------------------------------------------
+    - priority: 750
+      then:
+        - lambda: |-
+            id(boot_count) += 1;
+            // Monotónny čas stanice — jediná spoľahlivá časová os pre trend tlaku.
+            // Prirátame spánok, ktorý práve skončil (čas bdenia sa doráta neskôr).
+            id(station_seconds) += id(last_sleep_duration_s);
+            id(seconds_since_report) += id(last_sleep_duration_s);
+            ESP_LOGI("boot", "=== BOOT #%d | t=%.0f s ===", id(boot_count), id(station_seconds));
+        - output.turn_on: i2c_sensor_power
+        - output.turn_on: rain_sensor_power
+        # Zámerne BLOKUJÚCE čakanie (nie `- delay:`, ktorý by iba odložil zvyšok
+        # automatizácie a nechal setup() bežať ďalej). Musí byť krátke.
+        - lambda: 'delay(${sensor_power_settle_ms});'
+
+    # -------------------------------------------------------------------------
+    # FÁZA 2 — priorita -100: všetky komponenty sú inicializované
+    # -------------------------------------------------------------------------
+    - priority: -100
+      then:
+        - script.execute: failsafe_guard
+        - script.execute: main_cycle
+
+  on_shutdown:
+    then:
+      - logger.log:
+          level: INFO
+          tag: "shutdown"
+          format: "Vypínam senzory."
+      - output.turn_off: rain_sensor_power
+      - output.turn_off: i2c_sensor_power
+
+
+# ===========================================================================
+#  ESP32
+# ===========================================================================
+esp32:
+  # ── packages/core.yaml ───────────────────────────────────────────────
+  board: esp32dev
+  framework:
+    type: arduino
+
+
+# ===========================================================================
+#  LOGGER
+# ===========================================================================
+logger:
+  # ── packages/core.yaml ───────────────────────────────────────────────
+  level: ${log_level}
+  baud_rate: 0        # UART vypnutý — šetrí prúd, logy idú cez API
+  logs:
+    # Tieto komponenty by pri INFO zaplavili log publikovaním každej hodnoty.
+    sensor: WARN
+    binary_sensor: WARN
+    text_sensor: WARN
+    # Blokujúce `delay()` v boote inak vypíše "took a long time" varovanie.
+    component: ERROR
+
+
+# ===========================================================================
+#  WIFI
+# ===========================================================================
+wifi:
+  # ── packages/network.yaml ────────────────────────────────────────────
+  # NETWORK — WiFi, API, OTA
+  #
+  # Všetky citlivé hodnoty sú v secrets.yaml (pozri secrets.yaml.example).
+  # Do gitu nikdy nepatrí heslo ani API kľúč.
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Pri okne bdenia ~10 s je rýchle pripojenie lacnejšie než modem-sleep:
+  # celkovú spotrebu určuje DĹŽKA bdenia, nie priemerný odber počas neho.
+  power_save_mode: none
+  fast_connect: true            # preskočí scan, použije uložený kanál/BSSID
+  output_power: ${wifi_tx_power}
+
+  # Statická IP — obchádza nespoľahlivé mDNS a skracuje pripájanie o DHCP.
+  manual_ip:
+    static_ip: !secret meteo_static_ip
+    gateway: !secret network_gateway
+    subnet: !secret network_subnet
+    dns1: !secret network_dns
+
+  # Núdzový AP, ak sa nepodarí pripojiť.
+  ap:
+    ssid: "Meteostanica AP"
+    password: !secret ap_password
+    ap_timeout: ${wifi_ap_timeout}
+
+  on_connect:
+    then:
+      - lambda: 'id(wifi_fail_count) = 0;'
+      - logger.log:
+          level: INFO
+          tag: "wifi"
+          format: "WiFi OK, RSSI %d dBm"
+          # POZOR: `WiFi.RSSI()` je Arduino API a na ESP-IDF sa nepreloží.
+          # Toto je natívny prístup cez ESPHome a funguje na oboch frameworkoch.
+          args: ['wifi::global_wifi_component->wifi_rssi()']
+
+  on_disconnect:
+    then:
+      - logger.log:
+          level: WARN
+          tag: "wifi"
+          format: "WiFi odpojené."
+
+
+# ===========================================================================
+#  API
+# ===========================================================================
+api:
+  # ── packages/network.yaml ────────────────────────────────────────────
+  id: api_server
+  # Šifrovanie + autentifikácia. Kľúč vygeneruješ na
+  # https://esphome.io/components/api.html (tlačidlo "Generate") alebo:
+  #   python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+  encryption:
+    key: !secret api_encryption_key
+
+  # Pri deep sleep nesmie API reštartovať zariadenie, keď HA chvíľu nie je.
+  reboot_timeout: 0s
+
+  on_client_connected:
+    then:
+      - logger.log:
+          level: INFO
+          tag: "api"
+          format: "HA klient pripojený."
+
+
+# ===========================================================================
+#  OTA
+# ===========================================================================
+ota:
+  # ── packages/network.yaml ────────────────────────────────────────────
+  - platform: esphome
+    password: !secret ota_password
+    # POZNÁMKA: zariadenie je online len ~10 s v každom cykle. Na nahratie
+    # firmvéru zapni v HA prepínač "OTA režim (nespať)", počkaj na ďalšie
+    # prebudenie a stanica zostane hore, kým prepínač nevypneš.
+
+
+# ===========================================================================
+#  I2C
+# ===========================================================================
+i2c:
+  # ── packages/sensors_i2c.yaml ────────────────────────────────────────
+  # I2C SENZORY — BME280 (T/RH/p) a LTR390 (svetlo + UV)
+  #
+  # Obidva majú `update_interval: never` — číta ich výhradne skript main_cycle,
+  # aby bolo poradie operácií v okne bdenia deterministické.
+  id: busa
+  sda: ${pin_sda}
+  scl: ${pin_scl}
+  scan: false          # adresy poznáme, sken len zdržuje boot
+  frequency: 100kHz
+  timeout: 50ms
+
+
+# ===========================================================================
+#  DEEP_SLEEP
+# ===========================================================================
+deep_sleep:
+  # ── packages/power.yaml ──────────────────────────────────────────────
+  id: deep_sleep_control
+  # OPRAVA v2.x: bez tohto defaultu by `deep_sleep.enter` bez vypočítaného
+  # trvania (napr. cez prepínač "Vynútiť Deep Sleep" hneď po boote) uspal
+  # zariadenie NAVŽDY, až do manuálneho resetu.
+  sleep_duration: ${sleep_default}
+
+
+# ===========================================================================
+#  OUTPUT
+# ===========================================================================
+output:
+  # ── packages/power.yaml ──────────────────────────────────────────────
+  # POWER — napájacie rails, batéria, deep sleep
+  # POZOR (hardvér): pull-upy I2C zbernice MUSIA byť napájané z tejto spínanej
+  # vetvy. Ak visia na trvalej 3V3, senzory sa napájajú parazitne cez ochranné
+  # diódy na SDA/SCL a nikdy sa naozaj nevypnú.
+  - platform: gpio
+    pin: ${pin_i2c_power}
+    id: i2c_sensor_power
+
+  - platform: gpio
+    pin: ${pin_rain_power}
+    id: rain_sensor_power
+
+
+# ===========================================================================
+#  GLOBALS
+# ===========================================================================
+globals:
+  # ── packages/core.yaml ───────────────────────────────────────────────
+  # GLOBÁLNE PREMENNÉ
+  #
+  # restore_value: true  -> prežije deep sleep (RTC pamäť + NVS)
+  # restore_value: false -> platí len v rámci jedného bootu
+  # --- História tlaku (kruhový buffer) ---
+  # POZOR: počet prvkov v initial_value musí sedieť s ${press_hist_size}.
+  - id: pressure_history
+    type: float[${press_hist_size}]
+    restore_value: true
+    initial_value: "{NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN}"
+
+  # Časová os histórie v sekundách od prvého bootu (nie číslo bootu!).
+  # v2.x tu mala boot_count a prepočítavala ho AKTUÁLNOU dĺžkou spánku, čo dávalo
+  # nesprávne výsledky vždy, keď stanica prepla režim (2 / 5 / 10 / 30 min).
+  - id: pressure_time_s
+    type: float[${press_hist_size}]
+    restore_value: true
+    initial_value: "{NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN}"
+
+  - id: history_index
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: pressure_trend_value
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  - id: prev_humidity
+    type: float
+    restore_value: true
+    initial_value: "NAN"
+
+  # --- Čas ---
+  - id: station_seconds
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  - id: last_sleep_duration_s
+    type: float
+    restore_value: true
+    initial_value: "600.0"
+
+  # --- Zrážky (perzistentné, aby HA nevidela reset na 0 pri každom boote) ---
+  - id: rain_tips_total
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  # Preklopenia napočítané v poslednom nahlásenom intervale a jeho dĺžka.
+  # Držia sa oddelene od akumulátora, aby sa hodnoty senzorov nemenili
+  # uprostred okna bdenia (binárne senzory bežia v loop()).
+  - id: rain_tips_interval
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: rain_interval_seconds
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  # Beží od posledného hlásenia; v main_cycle sa prelieva do rain_interval_seconds.
+  - id: seconds_since_report
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  # --- Konfigurovateľné prahy (viazané na `number` entity) ---
+  - id: rain_pressure_trend_threshold
+    type: float
+    restore_value: true
+    initial_value: "-1.5"
+
+  - id: humidity_threshold
+    type: float
+    restore_value: true
+    initial_value: "80.0"
+
+  # --- Diagnostika ---
+  - id: boot_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: last_sleep_mode
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: wifi_fail_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: sensor_error_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+
+# ===========================================================================
+#  SENSOR
+# ===========================================================================
+sensor:
+  # ── packages/power.yaml ──────────────────────────────────────────────
+  # --- Napätie batérie -------------------------------------------------------
+  # Meria sa v main_cycle ako prvá vec, ešte kým WiFi nezaťaží zdroj.
+  - platform: adc
+    pin: ${pin_battery}
+    name: "Napätie batérie"
+    id: battery_voltage
+    update_interval: never
+    attenuation: 12db
+    samples: 16                 # hardvérové priemerovanie priamo v ADC
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    entity_category: diagnostic
+    filters:
+      - multiply: ${batt_multiplier}
+      - lambda: |-
+          if (x < 2.5f || x > 5.0f) {
+            ESP_LOGW("battery", "Podozrivé napätie: %.2f V", x);
+            return {};
+          }
+          return x;
+
+  # --- Percentá (po častiach lineárna krivka Li-ion) -------------------------
+  - platform: template
+    name: "Úroveň batérie"
+    id: battery_level
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    update_interval: never
+    lambda: |-
+      if (!id(battery_voltage).has_state()) return NAN;
+      float v = id(battery_voltage).state;
+      if (v >= 4.15f) return 100.0f;
+      if (v >= 4.00f) return 85.0f + (v - 4.00f) * 100.0f;
+      if (v >= 3.75f) return 35.0f + (v - 3.75f) * 200.0f;
+      if (v >= 3.50f) return 10.0f + (v - 3.50f) * 100.0f;
+      if (v >= 3.30f) return  2.0f + (v - 3.30f) *  40.0f;
+      if (v >= ${batt_min_voltage}) return 1.0f;
+      return 0.0f;
+
+  # ── packages/sensors_i2c.yaml ────────────────────────────────────────
+  # --- BME280 ---------------------------------------------------------------
+  - platform: bme280_i2c
+    address: 0x76
+    i2c_id: busa
+    id: bme280_sensor
+    update_interval: never
+
+    temperature:
+      name: "Vonkajšia Teplota"
+      id: bme280_temperature
+      oversampling: 4x
+      filters:
+        # Odmietnutie fyzikálne nemožných hodnôt. Filter iba validuje —
+        # počítadlo chýb sa aktualizuje v main_cycle, pretože filtre sa môžu
+        # vyhodnotiť viackrát a vedľajšie efekty v nich sú nespoľahlivé.
+        - lambda: |-
+            if (x < -40.0f || x > 60.0f) {
+              ESP_LOGW("bme280", "Odmietnutá teplota: %.1f °C", x);
+              return {};
+            }
+            return x;
+
+    pressure:
+      name: "Absolútny tlak"
+      id: bme280_pressure
+      oversampling: 4x
+      filters:
+        - lambda: |-
+            if (x < 800.0f || x > 1100.0f) {
+              ESP_LOGW("bme280", "Odmietnutý tlak: %.1f hPa", x);
+              return {};
+            }
+            return x;
+
+    humidity:
+      name: "Vonkajšia Vlhkosť"
+      id: bme280_humidity
+      oversampling: 4x
+      filters:
+        - lambda: |-
+            if (x < 0.0f || x > 100.0f) {
+              ESP_LOGW("bme280", "Odmietnutá vlhkosť: %.1f %%", x);
+              return {};
+            }
+            return x;
+
+  # --- LTR390 ---------------------------------------------------------------
+  - platform: ltr390
+    address: 0x53
+    i2c_id: busa
+    id: ltr390_sensor
+    update_interval: never
+    gain: "X3"
+    resolution: 18
+    # Kompenzácia útlmu krytu (1.0 = senzor priamo na vzduchu).
+    window_correction_factor: ${uv_window_factor}
+
+    light:
+      name: "Intenzita svetla"
+      id: ambient_light
+      filters:
+        - lambda: 'return (x < 0.0f) ? 0.0f : x;'
+
+    # OPRAVA v2.x: UV index sa počítal ako raw/170 — magická konštanta viazaná
+    # na konkrétny gain a rozlíšenie. Komponent ltr390 to vie sám a správne,
+    # vrátane window_correction_factor.
+    uv_index:
+      name: "UV Index"
+      id: uv_index_sensor
+      accuracy_decimals: 1
+      filters:
+        - lambda: |-
+            if (x < 0.0f) return 0.0f;
+            if (x > 15.0f) {
+              ESP_LOGW("uv", "Nereálny UVI: %.1f", x);
+              return {};
+            }
+            return x;
+
+  # ── packages/sensors_wind_rain.yaml ──────────────────────────────────
+  # VIETOR A ZRÁŽKY
+  #
+  # DÔLEŽITÉ OBMEDZENIE (deep sleep):
+  # Impulzné senzory počítajú len počas okna bdenia (~10 s z každého cyklu).
+  # Zrážkomer preto zachytí len preklopenia, ktoré nastanú počas bdenia; vietor
+  # je vzorka, nie priemer za celý interval. Riešenie cez ext0 prebudenie na
+  # ${pin_rain_bucket} je popísané v README (sekcia "Ďalší krok").
+  # Aspoň sa už ale kumulatívny súčet neresetuje pri každom boote — drží sa
+  # v RTC premennej `rain_tips_total`.
+  # ---------------------------------------------------------------------------
+  #  ANEMOMETER
+  # ---------------------------------------------------------------------------
+  - platform: pulse_counter
+    pin:
+      number: ${pin_wind_speed}
+      mode: INPUT_PULLUP
+    name: "Rýchlosť vetra"
+    id: wind_speed
+    unit_of_measurement: "km/h"
+    accuracy_decimals: 1
+    device_class: wind_speed
+    state_class: measurement
+    update_interval: ${wind_sample_interval}
+    # use_pcnt: true obmedzuje internal_filter na ~13 µs (limit PCNT hardvéru),
+    # čo je pri jazýčkovom kontakte málo a počítajú sa zákmity ako pulzy.
+    use_pcnt: false
+    internal_filter: ${wind_debounce}
+    filters:
+      - multiply: ${wind_pulse_to_kmh}
+      - lambda: 'return (x < ${wind_calm_threshold}) ? 0.0f : x;'
+
+  - platform: copy
+    source_id: wind_speed
+    name: "Rýchlosť vetra (Náraz)"
+    id: wind_gust
+    device_class: wind_speed
+    state_class: measurement
+    filters:
+      # Maximum za okno bdenia — nie skutočný meteorologický náraz.
+      - max:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+
+  # ---------------------------------------------------------------------------
+  #  KOROUHVIČKA (smer vetra)
+  # ---------------------------------------------------------------------------
+  - platform: adc
+    pin: ${pin_wind_vane}
+    id: wind_vane_voltage
+    internal: true
+    update_interval: never
+    attenuation: 12db
+    samples: 16
+
+  - platform: template
+    name: "Smer vetra (Uhol)"
+    id: wind_direction_angle
+    unit_of_measurement: "°"
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: "mdi:compass-rose"
+    # OPRAVA v2.x: tento senzor chýbal v zozname aktualizácií, takže sa počas
+    # okna bdenia nikdy nepublikoval.
+    update_interval: never
+    lambda: |-
+      if (!id(wind_vane_voltage).has_state()) return NAN;
+      float v = id(wind_vane_voltage).state;
+      if (v < 0.05f) return NAN;
+      // Pri bezvetrí korouhvička len visí — hodnota by nemala význam.
+      if (!id(wind_speed).has_state() || id(wind_speed).state < ${wind_calm_threshold}) return NAN;
+
+      // Delič: korouhvička na 3V3, ${wind_pullup_res} Ω na GND, uzol na ADC.
+      float r_vane = ${wind_pullup_res} * ((3.3f / v) - 1.0f);
+
+      struct WindDir { float resistance; float angle; };
+      static const WindDir DIRS[] = {
+        {  688, 112.5f}, {  891,  67.5f}, { 1000,  90.0f}, { 1410, 157.5f},
+        { 2200, 135.0f}, { 3140, 202.5f}, { 3900, 180.0f}, { 6570,  22.5f},
+        { 8200,  45.0f}, {14120, 247.5f}, {16000, 225.0f}, {21880, 337.5f},
+        {33000,   0.0f}, {42120, 292.5f}, {64900, 315.0f}, {120000, 270.0f}
+      };
+
+      float best_ratio = 1000.0f;
+      float best_angle = NAN;
+      for (int i = 0; i < 16; i++) {
+        float ratio = fabsf(r_vane - DIRS[i].resistance) / DIRS[i].resistance;
+        if (ratio < best_ratio) { best_ratio = ratio; best_angle = DIRS[i].angle; }
+      }
+      if (best_ratio > ${wind_vane_tolerance}) {
+        ESP_LOGW("wind_dir", "Neznámy odpor: %.0f Ω (U = %.3f V)", r_vane, v);
+        return NAN;
+      }
+      return best_angle;
+
+  # ---------------------------------------------------------------------------
+  #  ZRÁŽKOMER (preklopná nádobka)
+  # ---------------------------------------------------------------------------
+  - platform: pulse_counter
+    pin:
+      number: ${pin_rain_bucket}
+      mode: INPUT_PULLUP
+    id: rain_pulses
+    internal: true
+    update_interval: ${rain_sample_interval}
+    use_pcnt: false
+    internal_filter: ${rain_debounce}
+    total:
+      id: rain_pulses_total
+      internal: true
+      accuracy_decimals: 0
+
+  - platform: template
+    name: "Celkové zrážky"
+    id: rain_total
+    unit_of_measurement: "mm"
+    accuracy_decimals: 2
+    device_class: precipitation
+    # total_increasing: HA z toho vie urobiť denné/mesačné úhrny cez utility_meter.
+    # Vo v2.x sa počítadlo resetovalo pri každom boote, takže táto entita bola
+    # v štatistikách nepoužiteľná.
+    state_class: total_increasing
+    update_interval: never
+    lambda: 'return (float) id(rain_tips_total) * ${rain_mm_per_tip};'
+
+  - platform: template
+    name: "Intenzita zrážok"
+    id: rain_fall_rate
+    unit_of_measurement: "mm/h"
+    accuracy_decimals: 1
+    device_class: precipitation_intensity
+    state_class: measurement
+    update_interval: never
+    # Skutočný priemer za uplynulý interval (nie za 60 s okno, ktoré sa počas
+    # bdenia aj tak nikdy nestihlo).
+    lambda: |-
+      float hours = id(rain_interval_seconds) / 3600.0f;
+      if (hours < 0.0005f) return NAN;
+      return (float) id(rain_tips_interval) * ${rain_mm_per_tip} / hours;
+
+  # ---------------------------------------------------------------------------
+  #  ANALÓGOVÝ DAŽĎOVÝ SENZOR (doštička)
+  # ---------------------------------------------------------------------------
+  - platform: adc
+    pin: ${pin_rain_analog}
+    id: rain_sensor_voltage
+    name: "Napätie dažďového senzora"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: never
+    attenuation: 12db
+    samples: 8
+
+  - platform: template
+    name: "Vlhkosť dažďového senzora"
+    id: rain_sensor_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: "mdi:water-percent"
+    update_interval: never
+    lambda: |-
+      if (!id(rain_sensor_voltage).has_state()) return NAN;
+      float val = id(rain_sensor_voltage).state;
+      float dry = ${rain_calib_dry};
+      float wet = ${rain_calib_wet};
+      if (fabsf(dry - wet) < 0.01f) return NAN;
+      return clamp((val - dry) / (wet - dry) * 100.0f, 0.0f, 100.0f);
+
+  # ── packages/derived.yaml ────────────────────────────────────────────
+  # ODVODENÉ VELIČINY
+  #
+  # Všetko sú template senzory s `update_interval: never` — publikuje ich
+  # výhradne skript main_cycle, takže sa vždy počítajú z čerstvých vstupov
+  # a v správnom poradí.
+  # --- Tlak prepočítaný na hladinu mora --------------------------------------
+  - platform: template
+    name: "Tlak (Hladina mora)"
+    id: msl_pressure
+    unit_of_measurement: "hPa"
+    accuracy_decimals: 1
+    device_class: atmospheric_pressure
+    state_class: measurement
+    icon: "mdi:gauge"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_pressure).has_state()) return NAN;
+      float p = id(bme280_pressure).state;
+      float h = ${altitude_meters};
+      float t = id(bme280_temperature).has_state() ? id(bme280_temperature).state : 15.0f;
+      return p * powf(1.0f - (0.0065f * h) / (t + 0.0065f * h + 273.15f), -5.257f);
+
+  # --- Trend tlaku (počíta skript update_pressure_trend) ---------------------
+  - platform: template
+    name: "Tlakový trend"
+    id: pressure_trend_sensor
+    unit_of_measurement: "hPa/h"
+    accuracy_decimals: 2
+    state_class: measurement
+    icon: "mdi:trending-down"
+    update_interval: never
+    lambda: 'return id(pressure_trend_value);'
+
+  # --- Rosný bod (Magnus) ----------------------------------------------------
+  - platform: template
+    name: "Rosný bod"
+    id: dew_point
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    icon: "mdi:thermometer-water"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      if (RH <= 0.0f) return NAN;
+      const float a = 17.27f, b = 237.7f;
+      float alpha = ((a * T) / (b + T)) + logf(RH / 100.0f);
+      if (fabsf(a - alpha) < 0.001f) return NAN;
+      return (b * alpha) / (a - alpha);
+
+  # --- Absolútna vlhkosť -----------------------------------------------------
+  - platform: template
+    name: "Absolútna vlhkosť"
+    id: absolute_humidity
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 1
+    state_class: measurement
+    icon: "mdi:water"
+    update_interval: never
+    # OPRAVA v2.x: konštanta bola 2165 namiesto 216.7, výsledok bol 10× vyšší
+    # (pri 20 °C / 50 % RH hlásila ~86 g/m³ namiesto správnych ~8,6 g/m³).
+    # AH = e·M/(R·T);  M = 18.016 g/mol, R = 8.314 => 18.016/8.314·100 = 216.7
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      float es = 6.112f * expf((17.67f * T) / (T + 243.5f));   // [hPa]
+      return ((RH / 100.0f) * es * 216.7f) / (T + 273.15f);
+
+  # --- Thomov index nepohody -------------------------------------------------
+  - platform: template
+    name: "Index tepelného komfortu"
+    id: comfort_index
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    icon: "mdi:thermometer-check"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      return T - (0.55f - 0.0055f * RH) * (T - 14.5f);
+
+  # --- Pocitová teplota (wind chill / heat index) ----------------------------
+  - platform: template
+    name: "Pocitová teplota"
+    id: feels_like_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    icon: "mdi:thermometer-lines"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float t = id(bme280_temperature).state;
+      float h = id(bme280_humidity).state;
+      float v = id(wind_speed).has_state() ? id(wind_speed).state : 0.0f;
+
+      // Wind chill (JAG/TI) platí pre t <= 10 °C a v >= 4.8 km/h
+      if (t <= 10.0f && v >= 4.8f)
+        return 13.12f + (0.6215f * t) - (11.37f * powf(v, 0.16f))
+               + (0.3965f * t * powf(v, 0.16f));
+
+      // Heat index (Rothfusz, °C) platí pre t >= 26 °C a RH >= 40 %
+      if (t >= 26.0f && h >= 40.0f) {
+        float hi = -8.785f + 1.611f * t + 2.339f * h - 0.146f * t * h
+                   - 0.013f * t * t - 0.016f * h * h + 0.002f * t * t * h
+                   + 0.001f * t * h * h - 0.000004f * t * t * h * h;
+        return (hi > t) ? hi : t;
+      }
+      return t;
+
+  # ── packages/diagnostics.yaml ────────────────────────────────────────
+  - platform: uptime
+    name: "Čas behu"
+    id: uptime_sensor
+    entity_category: diagnostic
+    # Vo v2.x bolo `1s`, čo pri deep sleep znamenalo ~10 zbytočných publikácií
+    # za cyklus do HA recordera. Publikuje sa raz, v main_cycle.
+    update_interval: never
+
+  - platform: wifi_signal
+    name: "WiFi Signál dBm"
+    id: wifi_signal_dbm
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: copy
+    source_id: wifi_signal_dbm
+    name: "Kvalita WiFi"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    filters:
+      - lambda: |-
+          if (x <= -100.0f) return 0.0f;
+          if (x >=  -50.0f) return 100.0f;
+          return 2.0f * (x + 100.0f);
+
+  # Pozn.: pôvodný ESP32 nemá poriadny teplotný senzor jadra (hodnota pochádza
+  # z PHY bloku a je len orientačná). Nechané ako diagnostika, nie ako meranie.
+  - platform: internal_temperature
+    name: "Teplota CPU"
+    id: cpu_temperature
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    name: "Počet bootov"
+    id: boot_count_sensor
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: never
+    lambda: 'return (float) id(boot_count);'
+
+  - platform: template
+    name: "WiFi zlyhania (za sebou)"
+    id: wifi_fail_sensor
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: never
+    lambda: 'return (float) id(wifi_fail_count);'
+
+  - platform: template
+    name: "Chyby senzorov"
+    id: sensor_error_sensor
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: never
+    lambda: 'return (float) id(sensor_error_count);'
+
+
+# ===========================================================================
+#  BINARY_SENSOR
+# ===========================================================================
+binary_sensor:
+  # ── packages/power.yaml ──────────────────────────────────────────────
+  - platform: template
+    name: "Kritická batéria"
+    id: low_battery
+    device_class: battery
+    lambda: |-
+      if (!id(battery_voltage).has_state()) return false;
+      return id(battery_voltage).state < (${batt_min_voltage} + 0.1f);
+
+  # ── packages/sensors_wind_rain.yaml ──────────────────────────────────
+  - platform: template
+    name: "Detekcia dažďa"
+    id: rain_detection
+    device_class: moisture
+    lambda: |-
+      bool analog = id(rain_sensor_percent).has_state() &&
+                    !isnan(id(rain_sensor_percent).state) &&
+                    id(rain_sensor_percent).state > ${rain_moisture_threshold};
+      bool bucket = id(rain_tips_interval) > 0;
+      return analog || bucket;
+
+  # ── packages/derived.yaml ────────────────────────────────────────────
+  # POZOR: template binary_sensor NIE JE polling komponent — jeho lambda beží
+  # v loop(), teda stovky krát za sekundu. Preto tu nesmie byť žiadny vedľajší
+  # efekt (vo v2.x tu `rain_prediction` prepisovala históriu tlaku, čím ju
+  # kompletne znehodnotila). Zápisy do globals robí výhradne main_cycle.
+  #
+  # Z rovnakého dôvodu tu nie sú `delayed_on: 30s/60s` filtre — pri okne bdenia
+  # ~10 s by sa nikdy nedokončili a výstrahy by sa nezopli. Hysterézu je
+  # správne riešiť až v Home Assistante (`for:` v automatizácii).
+
+  - platform: template
+    name: "Riziko mrazu"
+    id: frost_risk
+    icon: "mdi:snowflake-alert"
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(dew_point).has_state()) return false;
+      return (id(bme280_temperature).state < ${frost_temp_threshold}) &&
+             (id(dew_point).state < 0.0f);
+
+  - platform: template
+    name: "Výstraha: Búrka"
+    id: storm_warning
+    icon: "mdi:weather-lightning-rainy"
+    lambda: 'return id(pressure_trend_value) < ${storm_pressure_drop};'
+
+  - platform: template
+    name: "Predikcia dažďa (Tlak)"
+    id: rain_prediction
+    icon: "mdi:weather-rainy"
+    lambda: |-
+      if (!id(bme280_pressure).has_state() || !id(bme280_humidity).has_state()) return false;
+      float cur_p = id(bme280_pressure).state;
+      float hum   = id(bme280_humidity).state;
+      float trend = id(pressure_trend_value);
+
+      // Priemer z histórie — len čítanie, žiadny zápis.
+      int valid = 0; float sum = 0.0f;
+      for (int i = 0; i < ${press_hist_size}; i++) {
+        float p = id(pressure_history)[i];
+        if (!isnan(p) && p > 800.0f) { sum += p; valid++; }
+      }
+      float avg = (valid >= 2) ? (sum / valid) : NAN;
+
+      bool hum_rising = !isnan(id(prev_humidity)) && ((hum - id(prev_humidity)) > 2.0f);
+
+      if (!isnan(avg) && trend < id(rain_pressure_trend_threshold)
+          && cur_p < avg && hum_rising) return true;
+      if (cur_p < 1000.0f && hum > id(humidity_threshold)) return true;
+      if (trend < ${storm_pressure_drop}) return true;
+      return false;
+
+  # ── packages/diagnostics.yaml ────────────────────────────────────────
+  # DIAGNOSTIKA
+  - platform: status
+    name: "Status stanice"
+
+  - platform: template
+    name: "Chyba senzorov"
+    id: sensor_problem
+    device_class: problem
+    entity_category: diagnostic
+    lambda: 'return id(sensor_error_count) > 0;'
+
+
+# ===========================================================================
+#  TEXT_SENSOR
+# ===========================================================================
+text_sensor:
+  # ── packages/text_sensors.yaml ───────────────────────────────────────
+  # TEXTOVÉ SENZORY — ľudsky čitateľné zhrnutia pre dashboard
+  # --- Smer vetra slovom -----------------------------------------------------
+  - platform: template
+    name: "Smer vetra (Text)"
+    id: wind_dir_text
+    icon: "mdi:compass"
+    update_interval: never
+    lambda: |-
+      if (!id(wind_direction_angle).has_state()) return std::string("N/A");
+      float angle = id(wind_direction_angle).state;
+      if (isnan(angle)) return std::string("Bezvetrie");
+      static const char *const DIRS[] = {
+        "S", "SSV", "SV", "VSV", "V", "VJV", "JV", "JJV",
+        "J", "JJZ", "JZ", "ZJZ", "Z", "ZSZ", "SZ", "SSZ"
+      };
+      int idx = (int) ((angle + 11.25f) / 22.5f) % 16;
+      if (idx < 0) idx += 16;
+      return std::string(DIRS[idx]);
+
+  # --- Beaufortova stupnica --------------------------------------------------
+  - platform: template
+    name: "Sila vetra (Beaufort)"
+    id: wind_beaufort_text
+    icon: "mdi:weather-windy"
+    update_interval: never
+    # OPRAVA v2.x: hranice boli posunuté o jeden stupeň (12–19 km/h je B3,
+    # nie B4). Nižšie sú oficiálne hranice stupnice v km/h.
+    lambda: |-
+      if (!id(wind_speed).has_state()) return std::string("N/A");
+      float v = id(wind_speed).state;
+      if (v <   1.0f) return std::string("0 – Bezvetrie");
+      if (v <   6.0f) return std::string("1 – Vánok");
+      if (v <  12.0f) return std::string("2 – Slabý vietor");
+      if (v <  20.0f) return std::string("3 – Mierny vietor");
+      if (v <  29.0f) return std::string("4 – Dosť čerstvý vietor");
+      if (v <  39.0f) return std::string("5 – Čerstvý vietor");
+      if (v <  50.0f) return std::string("6 – Silný vietor");
+      if (v <  62.0f) return std::string("7 – Mierny víchor");
+      if (v <  75.0f) return std::string("8 – Čerstvý víchor");
+      if (v <  89.0f) return std::string("9 – Silný víchor");
+      if (v < 103.0f) return std::string("10 – Víchrica ⚠️");
+      if (v < 118.0f) return std::string("11 – Mohutná víchrica ⚠️");
+      return std::string("12 – Orkán ⚠️");
+
+  # --- Intenzita zrážok slovom ----------------------------------------------
+  - platform: template
+    name: "Intenzita zrážok (Text)"
+    id: rain_intensity_text
+    icon: "mdi:weather-pouring"
+    update_interval: never
+    lambda: |-
+      if (!id(rain_detection).state) return std::string("Bez dažďa");
+      if (!id(rain_fall_rate).has_state() || isnan(id(rain_fall_rate).state))
+        return std::string("Prší");
+      float r = id(rain_fall_rate).state;
+      if (r <  2.5f) return std::string("🌂 Mrholenie");
+      if (r <  7.5f) return std::string("🌧️ Ľahký dážď");
+      if (r < 15.0f) return std::string("🌧️ Mierny dážď");
+      if (r < 30.0f) return std::string("⛈️ Silný dážď");
+      return std::string("⛈️ PRÍVALOVÝ DÁŽĎ ⚠️");
+
+  # --- Odporúčanie oblečenia -------------------------------------------------
+  - platform: template
+    name: "Odporúčanie oblečenia"
+    id: clothing_recommendation
+    icon: "mdi:hanger"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state()) return std::string("Načítavam...");
+      float t    = id(bme280_temperature).state;
+      float uvi  = id(uv_index_sensor).has_state() ? id(uv_index_sensor).state : 0.0f;
+      float wind = id(wind_speed).has_state() ? id(wind_speed).state : 0.0f;
+      bool rain   = id(rain_prediction).state || id(rain_detection).state;
+      bool frost  = id(frost_risk).state;
+      bool windy  = wind > 25.0f;
+      bool highUV = uvi >= 6.0f;
+
+      if (frost) return std::string("🧊 Pozor na mráz! Protišmykové topánky, rukavice.");
+      if (rain) {
+        if (t <  3.0f) return std::string("🥶 Ľadový dážď! Zimná bunda, dáždnik, pozor na námrazu!");
+        if (t < 10.0f) return std::string("🌧️ Prší a je zima. Zimná bunda + dáždnik.");
+        if (t < 20.0f) return std::string("🌦️ Prší. Nepremokavá bunda.");
+        return std::string("⛈️ Teplý dážď. Ľahká bunda + dáždnik.");
+      }
+      if (t < -5.0f) return std::string("🧊 Tuhý mráz! Vrstvy, zimná bunda, čiapka, šál, rukavice.");
+      if (t <  5.0f) return std::string("❄️ Mráz! Zimná bunda, čiapka, rukavice.");
+      if (t < 15.0f) {
+        if (windy) return std::string("💨 Chladno a veterno. Vetrovka + sveter.");
+        return std::string("🧥 Chladno. Sveter a bunda.");
+      }
+      if (t < 22.0f) return std::string("👕 Príjemne. Mikina alebo tričko.");
+      if (t < 30.0f) {
+        if (highUV) return std::string("☀️ Teplo + silné UV! Tričko, opaľovací krém SPF50+, klobúk.");
+        return std::string("☀️ Teplo. Tričko, nezabudni na opaľovací krém.");
+      }
+      return std::string("🔥 Horúčava! Naľahko, veľa pitia, hľadaj tieň.");
+
+  # --- Krátka predpoveď ------------------------------------------------------
+  - platform: template
+    name: "Predpoveď počasia"
+    id: weather_forecast_text
+    icon: "mdi:weather-partly-cloudy"
+    update_interval: never
+    lambda: |-
+      float trend = id(pressure_trend_value);
+      float uvi   = id(uv_index_sensor).has_state() ? id(uv_index_sensor).state : 0.0f;
+
+      if (id(storm_warning).state)   return std::string("⛈️ Búrka! Rýchly pokles tlaku.");
+      if (id(rain_detection).state)  return std::string("🌧️ Momentálne prší.");
+      if (id(rain_prediction).state) return std::string("🌦️ Predpoveď: Možný dážď.");
+      if (id(frost_risk).state)      return std::string("🧊 Hrozí mráz — pozor na poľadovicu.");
+
+      if (id(bme280_temperature).has_state()) {
+        if (trend > 1.0f) {
+          if (uvi >= 6.0f) return std::string("☀️ Vyjasňuje sa, silné UV žiarenie.");
+          return std::string("⛅ Vyjasňuje sa.");
+        }
+        if (trend < -1.0f) return std::string("🌤️ Zhoršovanie počasia.");
+        if (uvi >= 3.0f)   return std::string("☀️ Jasno, stabilný tlak.");
+      }
+      return std::string("🌡️ Stabilné počasie.");
+
+  # --- Aktuálny režim spánku -------------------------------------------------
+  - platform: template
+    name: "Režim stanice"
+    id: station_mode_text
+    icon: "mdi:sleep"
+    entity_category: diagnostic
+    update_interval: never
+    lambda: |-
+      switch (id(last_sleep_mode)) {
+        case 1:  return std::string("⛈️ STORM (2 min)");
+        case 2:  return std::string("🔋 ECO (30 min)");
+        case 3:  return std::string("🚀 PERF (5 min)");
+        default: return std::string("🔄 Normal (10 min)");
+      }
+
+
+# ===========================================================================
+#  SWITCH
+# ===========================================================================
+switch:
+  # ── packages/controls.yaml ───────────────────────────────────────────
+  # OVLÁDACIE PRVKY — prepínače, tlačidlá, konfiguračné čísla
+  # ---------------------------------------------------------------------------
+  #  OTA REŽIM — jediný spoľahlivý spôsob, ako udržať stanicu hore
+  #
+  #  Vo v2.x sa na to používalo `deep_sleep.prevent` v on_client_connected.
+  #  Nefungovalo to: akcia `deep_sleep.enter` volá begin_sleep(manual = true),
+  #  ktorá príznak `prevent_` zámerne obchádza. Stanica teda zaspala aj s
+  #  pripojeným HA klientom a OTA okno reálne neexistovalo.
+  #
+  #  Použitie: zapni prepínač v HA, počkaj na najbližšie prebudenie (max. dĺžka
+  #  aktuálneho režimu), stanica zostane online. Po nahratí firmvéru vypni.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "OTA režim (nespať)"
+    id: ota_mode
+    icon: "mdi:progress-upload"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # musí prežiť deep sleep
+    turn_on_action:
+      - logger.log:
+          level: INFO
+          tag: "ota"
+          format: "OTA režim ZAPNUTÝ — stanica zostane hore."
+      - script.stop: failsafe_guard
+    turn_off_action:
+      - logger.log:
+          level: INFO
+          tag: "ota"
+          format: "OTA režim vypnutý — idem spať pri najbližšej kontrole."
+
+  - platform: template
+    name: "Manuálne napájanie senzorov"
+    id: manual_sensor_power
+    icon: "mdi:power-plug"
+    entity_category: config
+    optimistic: true
+    turn_on_action:
+      - output.turn_on: rain_sensor_power
+      - output.turn_on: i2c_sensor_power
+    turn_off_action:
+      - output.turn_off: rain_sensor_power
+      - output.turn_off: i2c_sensor_power
+
+  - platform: restart
+    name: "Reštartovať stanicu"
+    entity_category: config
+
+
+# ===========================================================================
+#  BUTTON
+# ===========================================================================
+button:
+  # ── packages/controls.yaml ───────────────────────────────────────────
+  - platform: template
+    name: "Vynútiť Deep Sleep"
+    icon: "mdi:sleep"
+    entity_category: config
+    on_press:
+      # Bezpečné aj hneď po boote — deep_sleep má nakonfigurovaný default
+      # sleep_duration (packages/power.yaml).
+      - deep_sleep.enter: deep_sleep_control
+
+  - platform: template
+    name: "Reset diagnostiky"
+    icon: "mdi:restore"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(sensor_error_count) = 0;
+          id(wifi_fail_count) = 0;
+          ESP_LOGI("diag", "Diagnostické počítadlá resetované.");
+
+  - platform: template
+    name: "Reset počítadla zrážok"
+    icon: "mdi:water-off"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(rain_tips_total) = 0;
+          id(rain_tips_interval) = 0;
+          ESP_LOGI("rain", "Počítadlo zrážok vynulované.");
+      - component.update: rain_total
+
+
+# ===========================================================================
+#  NUMBER
+# ===========================================================================
+number:
+  # ── packages/controls.yaml ───────────────────────────────────────────
+  # Obidve hodnoty majú vlastnú `restore_value` globálku (packages/core.yaml),
+  # takže prežijú deep sleep aj bez týchto entít. initial_value tu musí sedieť
+  # s initial_value danej globálky.
+  - platform: template
+    name: "Prah trendu tlaku"
+    id: rain_trend_threshold_config
+    unit_of_measurement: "hPa/h"
+    min_value: -5.0
+    max_value: 0.0
+    step: 0.1
+    initial_value: -1.5
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    mode: box
+    set_action:
+      - lambda: 'id(rain_pressure_trend_threshold) = x;'
+
+  - platform: template
+    name: "Prah vlhkosti pre dážď"
+    id: humidity_threshold_config
+    unit_of_measurement: "%"
+    min_value: 60.0
+    max_value: 95.0
+    step: 1.0
+    initial_value: 80.0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    mode: box
+    set_action:
+      - lambda: 'id(humidity_threshold) = x;'
+
+
+# ===========================================================================
+#  SCRIPT
+# ===========================================================================
+script:
+  # ── packages/scripts.yaml ────────────────────────────────────────────
+  # LOGIKA CYKLU
+  #
+  # Celé okno bdenia riadi jeden skript (main_cycle) v pevnom poradí:
+  # čítanie -> účtovníctvo -> trend -> rozhodnutie o spánku -> publikovanie
+  # -> čakanie na HA -> spánok
+  #
+  # Vo v2.x bolo poradie neurčité: trend sa počítal z `on_value` tlaku, ale
+  # históriu plnila lambda binárneho senzora bežiaca v loop(). Výsledok
+  # nezodpovedal nameraným dátam.
+  # ---------------------------------------------------------------------------
+  #  FAILSAFE — ak cyklus zamrzne (zaseknuté I2C, wait_until bez timeoutu...),
+  #  po ${sleep_failsafe} zariadenie tvrdo uspíme, aby nevybilo batériu.
+  # ---------------------------------------------------------------------------
+  - id: failsafe_guard
+    mode: restart
+    then:
+      - delay: ${sleep_failsafe}
+      - if:
+          condition:
+            switch.is_on: ota_mode
+          then:
+            - logger.log:
+                level: WARN
+                tag: "failsafe"
+                format: "Failsafe preskočený — je zapnutý OTA režim."
+          else:
+            - logger.log:
+                level: ERROR
+                tag: "failsafe"
+                format: "Failsafe! Boot #%d — núdzový spánok."
+                args: ['id(boot_count)']
+            - lambda: 'id(sensor_error_count) += 1;'
+            - deep_sleep.enter:
+                id: deep_sleep_control
+                sleep_duration: ${sleep_default}
+
+  # ---------------------------------------------------------------------------
+  #  HLAVNÝ CYKLUS
+  # ---------------------------------------------------------------------------
+  - id: main_cycle
+    mode: single
+    then:
+      # --- 1) Batéria ako prvá, kým rádio ešte nezaťažilo zdroj --------------
+      - component.update: battery_voltage
+      - component.update: battery_level
+
+      # --- 2) I2C senzory ----------------------------------------------------
+      # Prvé čítanie BME280 po štarte zahadzujeme (registre ešte nie sú
+      # naplnené prevodom). Jedno zahriatie stačí — v2.x tu mala tri čítania
+      # so 150 ms pauzami, čo len predlžovalo okno bdenia.
+      - component.update: bme280_sensor
+      - delay: 120ms
+      - component.update: bme280_sensor
+      - component.update: ltr390_sensor
+
+      # --- 3) Analógové vstupy a impulzné počítadlá --------------------------
+      - component.update: rain_sensor_voltage
+      - component.update: rain_sensor_percent
+      - component.update: wind_vane_voltage
+      - component.update: rain_pulses
+
+      # --- 4) Účtovníctvo (jediné miesto, kde sa zapisuje do globals) --------
+      - lambda: |-
+          // 4a) Zdravie senzorov
+          bool ok = id(bme280_temperature).has_state() &&
+                    !isnan(id(bme280_temperature).state);
+          if (ok) {
+            id(sensor_error_count) = 0;
+          } else {
+            id(sensor_error_count) += 1;
+            ESP_LOGW("sensors", "BME280 nedodal platné dáta (%d× za sebou).",
+                     id(sensor_error_count));
+          }
+
+          // 4b) Zrážky: pulse_counter počíta od bootu, preto pripočítame jeho
+          //     stav do RTC premennej a vynulujeme merací interval.
+          int tips = 0;
+          if (id(rain_pulses_total).has_state() && !isnan(id(rain_pulses_total).state))
+            tips = (int) lroundf(id(rain_pulses_total).state);
+          id(rain_tips_total)    += tips;
+          id(rain_tips_interval)  = tips;
+          id(rain_interval_seconds) = id(seconds_since_report);
+          id(seconds_since_report) = 0.0f;
+          if (tips > 0)
+            ESP_LOGI("rain", "+%d preklopení (spolu %d)", tips, id(rain_tips_total));
+
+
+      # --- 5) Trend tlaku ----------------------------------------------------
+      - script.execute: update_pressure_trend
+
+      # --- 6) Rozhodnutie o režime spánku ------------------------------------
+      # Vedome PRED publikovaním, aby entita "Režim stanice" ukazovala režim,
+      # do ktorého stanica práve ide, a nie ten z minulého cyklu.
+      - script.execute: decide_sleep_mode
+
+      # --- 7) Publikovanie ---------------------------------------------------
+      - script.execute: publish_all
+
+      # Predikcia dažďa je vyhodnotená (binárne senzory bežia v loop()),
+      # takže až teraz si môžeme zapamätať vlhkosť pre nasledujúci cyklus.
+      - lambda: |-
+          if (id(bme280_humidity).has_state() && !isnan(id(bme280_humidity).state))
+            id(prev_humidity) = id(bme280_humidity).state;
+
+      # --- 8) Sieť -----------------------------------------------------------
+      - wait_until:
+          condition:
+            wifi.connected:
+          timeout: ${wifi_wait_timeout}
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - wait_until:
+                condition:
+                  api.connected:
+                timeout: ${api_wait_timeout}
+            - if:
+                condition:
+                  api.connected:
+                then:
+                  # Stavy sú už publikované; HA ich dostane pri subscribe.
+                  - delay: ${publish_flush_delay}
+                else:
+                  - logger.log:
+                      level: WARN
+                      tag: "net"
+                      format: "WiFi OK, ale API nedostupné."
+                  - script.execute: network_failure_sleep
+          else:
+            - logger.log:
+                level: WARN
+                tag: "net"
+                format: "WiFi sa nepripojilo."
+            - script.execute: network_failure_sleep
+
+      # --- 9) Spánok ---------------------------------------------------------
+      - script.execute: check_and_enter_deep_sleep
+
+  # ---------------------------------------------------------------------------
+  #  TREND TLAKU — zápis vzorky + lineárna regresia
+  # ---------------------------------------------------------------------------
+  - id: update_pressure_trend
+    mode: single
+    then:
+      - lambda: |-
+          const int N = ${press_hist_size};
+
+          // --- 1) Nová vzorka do kruhového buffera ---
+          if (id(bme280_pressure).has_state() && !isnan(id(bme280_pressure).state)) {
+            float p = id(bme280_pressure).state;
+            if (p > 800.0f && p < 1100.0f) {
+              int i = id(history_index) % N;
+              id(pressure_history)[i] = p;
+              // Časová os v sekundách od prvého bootu — nezávislá od toho,
+              // ako často stanica práve meria.
+              id(pressure_time_s)[i] = id(station_seconds);
+              id(history_index) = (id(history_index) + 1) % N;
+            }
+          }
+
+          // --- 2) Priemery (1. prechod) ---
+          float sx = 0.0f, sy = 0.0f;
+          int n = 0;
+          for (int i = 0; i < N; i++) {
+            float p = id(pressure_history)[i];
+            float t = id(pressure_time_s)[i];
+            if (isnan(p) || isnan(t) || p < 800.0f) continue;
+            sx += t / 3600.0f;
+            sy += p;
+            n++;
+          }
+          if (n < 2) {
+            id(pressure_trend_value) = 0.0f;
+            ESP_LOGD("pressure", "Málo vzoriek (n=%d), trend = 0.", n);
+            return;
+          }
+          float xbar = sx / n, ybar = sy / n;
+
+          // --- 3) Regresia okolo priemeru (2. prechod) ---
+          // Centrovanie je tu kvôli presnosti: `station_seconds` rastie do
+          // miliónov a float by pri klasickom vzorci strácal platné číslice.
+          float num = 0.0f, den = 0.0f;
+          for (int i = 0; i < N; i++) {
+            float p = id(pressure_history)[i];
+            float t = id(pressure_time_s)[i];
+            if (isnan(p) || isnan(t) || p < 800.0f) continue;
+            float dx = (t / 3600.0f) - xbar;
+            num += dx * (p - ybar);
+            den += dx * dx;
+          }
+          if (den < 1e-9f) {
+            id(pressure_trend_value) = 0.0f;
+            return;
+          }
+          id(pressure_trend_value) = clamp(num / den, -10.0f, 10.0f);
+          ESP_LOGI("pressure", "Trend: %.2f hPa/h (n=%d)", id(pressure_trend_value), n);
+
+  # ---------------------------------------------------------------------------
+  #  ROZHODNUTIE O DĹŽKE SPÁNKU
+  # ---------------------------------------------------------------------------
+  - id: decide_sleep_mode
+    mode: single
+    then:
+      - lambda: |-
+          float bat = (id(battery_level).has_state() && !isnan(id(battery_level).state))
+                        ? id(battery_level).state : 50.0f;
+          float wind = id(wind_speed).has_state() ? id(wind_speed).state : 0.0f;
+          bool active = id(rain_detection).state || id(rain_prediction).state ||
+                        id(storm_warning).state  || wind > ${wind_storm_threshold};
+
+          uint32_t sleep_ms = ${sleep_normal_mode_ms};
+          int mode_id = 0;
+
+          if (bat < ${bat_eco_threshold}) {
+            sleep_ms = ${sleep_eco_mode_ms};  mode_id = 2;   // ECO
+          } else if (active && bat > ${bat_storm_min}) {
+            sleep_ms = ${sleep_storm_mode_ms}; mode_id = 1;  // STORM
+          } else if (bat > ${bat_perf_threshold}) {
+            sleep_ms = ${sleep_perf_mode_ms}; mode_id = 3;   // PERF
+          }
+
+          id(last_sleep_duration_s) = (float) sleep_ms / 1000.0f;
+          id(last_sleep_mode) = mode_id;
+          id(deep_sleep_control).set_sleep_duration(sleep_ms);
+
+          static const char *const NAMES[] = {"Normal", "STORM", "ECO", "PERF"};
+          ESP_LOGI("sleep", "Režim %s | %u s | bat %.0f %% | vietor %.1f km/h",
+                   NAMES[mode_id], (unsigned) (sleep_ms / 1000), bat, wind);
+
+  # ---------------------------------------------------------------------------
+  #  SKRÁTENÝ SPÁNOK PRI VÝPADKU SIETE
+  # ---------------------------------------------------------------------------
+  - id: network_failure_sleep
+    mode: single
+    then:
+      - lambda: |-
+          id(wifi_fail_count) += 1;
+          uint32_t ms = (id(wifi_fail_count) >= ${wifi_fail_limit})
+                          ? ${sleep_wifi_dead_ms} : ${sleep_no_wifi_ms};
+          id(last_sleep_duration_s) = (float) ms / 1000.0f;
+          id(deep_sleep_control).set_sleep_duration(ms);
+          ESP_LOGW("net", "Zlyhanie siete #%d — spím %u s.",
+                   id(wifi_fail_count), (unsigned) (ms / 1000));
+
+  # ---------------------------------------------------------------------------
+  #  PUBLIKOVANIE
+  #
+  #  Všetky template sensory a text sensory majú `update_interval: never`,
+  #  takže jediné, čo ich posunie do HA, je tento zoznam. Poradie rešpektuje
+  #  závislosti (odvodené veličiny -> texty, ktoré ich používajú).
+  #
+  #  POZOR: binárne senzory tu zámerne nie sú — `binary_sensor.template` nie je
+  #  polling komponent a `component.update` by na ňom bola chyba konfigurácie.
+  #  Vyhodnocuje sa priebežne v loop().
+  # ---------------------------------------------------------------------------
+  - id: publish_all
+    mode: single
+    then:
+      # Odvodené veličiny
+      - component.update: msl_pressure
+      - component.update: pressure_trend_sensor
+      - component.update: dew_point
+      - component.update: absolute_humidity
+      - component.update: comfort_index
+      - component.update: feels_like_temp
+      # Vietor a zrážky
+      - component.update: wind_direction_angle
+      - component.update: rain_total
+      - component.update: rain_fall_rate
+      # Diagnostika
+      - component.update: uptime_sensor
+      - component.update: wifi_signal_dbm
+      - component.update: cpu_temperature
+      - component.update: boot_count_sensor
+      - component.update: wifi_fail_sensor
+      - component.update: sensor_error_sensor
+      # Texty (závisia od všetkého vyššie)
+      - component.update: wind_dir_text
+      - component.update: wind_beaufort_text
+      - component.update: rain_intensity_text
+      - component.update: clothing_recommendation
+      - component.update: weather_forecast_text
+      - component.update: station_mode_text
+
+  # ---------------------------------------------------------------------------
+  #  SPÁNOK
+  # ---------------------------------------------------------------------------
+  - id: check_and_enter_deep_sleep
+    mode: single
+    then:
+      - if:
+          condition:
+            switch.is_on: ota_mode
+          then:
+            - logger.log:
+                level: WARN
+                tag: "sleep"
+                format: "OTA režim je zapnutý — nespím, čakám na firmvér."
+            - script.stop: failsafe_guard
+          else:
+            - lambda: |-
+                // Doplň čas bdenia do monotónnej osi aj do merania intervalu.
+                float awake = millis() / 1000.0f;
+                id(station_seconds) += awake;
+                id(seconds_since_report) += awake;
+            - deep_sleep.enter: deep_sleep_control

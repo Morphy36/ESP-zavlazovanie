@@ -1,0 +1,74 @@
+# =============================================================================
+#  NETWORK — WiFi, API, OTA
+#
+#  Všetky citlivé hodnoty sú v secrets.yaml (pozri secrets.yaml.example).
+#  Do gitu nikdy nepatrí heslo ani API kľúč.
+# =============================================================================
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Pri okne bdenia ~10 s je rýchle pripojenie lacnejšie než modem-sleep:
+  # celkovú spotrebu určuje DĹŽKA bdenia, nie priemerný odber počas neho.
+  power_save_mode: none
+  fast_connect: true            # preskočí scan, použije uložený kanál/BSSID
+  output_power: ${wifi_tx_power}
+
+  # Statická IP — obchádza nespoľahlivé mDNS a skracuje pripájanie o DHCP.
+  manual_ip:
+    static_ip: !secret meteo_static_ip
+    gateway: !secret network_gateway
+    subnet: !secret network_subnet
+    dns1: !secret network_dns
+
+  # Núdzový AP, ak sa nepodarí pripojiť.
+  ap:
+    ssid: "Meteostanica AP"
+    password: !secret ap_password
+    ap_timeout: ${wifi_ap_timeout}
+
+  on_connect:
+    then:
+      - lambda: 'id(wifi_fail_count) = 0;'
+      - logger.log:
+          level: INFO
+          tag: "wifi"
+          format: "WiFi OK, RSSI %d dBm"
+          # POZOR: `WiFi.RSSI()` je Arduino API a na ESP-IDF sa nepreloží.
+          # Toto je natívny prístup cez ESPHome a funguje na oboch frameworkoch.
+          args: ['wifi::global_wifi_component->wifi_rssi()']
+
+  on_disconnect:
+    then:
+      - logger.log:
+          level: WARN
+          tag: "wifi"
+          format: "WiFi odpojené."
+
+
+api:
+  id: api_server
+  # Šifrovanie + autentifikácia. Kľúč vygeneruješ na
+  # https://esphome.io/components/api.html (tlačidlo "Generate") alebo:
+  #   python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+  encryption:
+    key: !secret api_encryption_key
+
+  # Pri deep sleep nesmie API reštartovať zariadenie, keď HA chvíľu nie je.
+  reboot_timeout: 0s
+
+  on_client_connected:
+    then:
+      - logger.log:
+          level: INFO
+          tag: "api"
+          format: "HA klient pripojený."
+
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    # POZNÁMKA: zariadenie je online len ~10 s v každom cykle. Na nahratie
+    # firmvéru zapni v HA prepínač "OTA režim (nespať)", počkaj na ďalšie
+    # prebudenie a stanica zostane hore, kým prepínač nevypneš.

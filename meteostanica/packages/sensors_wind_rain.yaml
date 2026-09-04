@@ -1,0 +1,187 @@
+# =============================================================================
+#  VIETOR A ZRÁŽKY
+#
+#  DÔLEŽITÉ OBMEDZENIE (deep sleep):
+#  Impulzné senzory počítajú len počas okna bdenia (~10 s z každého cyklu).
+#  Zrážkomer preto zachytí len preklopenia, ktoré nastanú počas bdenia; vietor
+#  je vzorka, nie priemer za celý interval. Riešenie cez ext0 prebudenie na
+#  ${pin_rain_bucket} je popísané v README (sekcia "Ďalší krok").
+#  Aspoň sa už ale kumulatívny súčet neresetuje pri každom boote — drží sa
+#  v RTC premennej `rain_tips_total`.
+# =============================================================================
+
+sensor:
+  # ---------------------------------------------------------------------------
+  #  ANEMOMETER
+  # ---------------------------------------------------------------------------
+  - platform: pulse_counter
+    pin:
+      number: ${pin_wind_speed}
+      mode: INPUT_PULLUP
+    name: "Rýchlosť vetra"
+    id: wind_speed
+    unit_of_measurement: "km/h"
+    accuracy_decimals: 1
+    device_class: wind_speed
+    state_class: measurement
+    update_interval: ${wind_sample_interval}
+    # use_pcnt: true obmedzuje internal_filter na ~13 µs (limit PCNT hardvéru),
+    # čo je pri jazýčkovom kontakte málo a počítajú sa zákmity ako pulzy.
+    use_pcnt: false
+    internal_filter: ${wind_debounce}
+    filters:
+      - multiply: ${wind_pulse_to_kmh}
+      - lambda: 'return (x < ${wind_calm_threshold}) ? 0.0f : x;'
+
+  - platform: copy
+    source_id: wind_speed
+    name: "Rýchlosť vetra (Náraz)"
+    id: wind_gust
+    device_class: wind_speed
+    state_class: measurement
+    filters:
+      # Maximum za okno bdenia — nie skutočný meteorologický náraz.
+      - max:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+
+  # ---------------------------------------------------------------------------
+  #  KOROUHVIČKA (smer vetra)
+  # ---------------------------------------------------------------------------
+  - platform: adc
+    pin: ${pin_wind_vane}
+    id: wind_vane_voltage
+    internal: true
+    update_interval: never
+    attenuation: 12db
+    samples: 16
+
+  - platform: template
+    name: "Smer vetra (Uhol)"
+    id: wind_direction_angle
+    unit_of_measurement: "°"
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: "mdi:compass-rose"
+    # OPRAVA v2.x: tento senzor chýbal v zozname aktualizácií, takže sa počas
+    # okna bdenia nikdy nepublikoval.
+    update_interval: never
+    lambda: |-
+      if (!id(wind_vane_voltage).has_state()) return NAN;
+      float v = id(wind_vane_voltage).state;
+      if (v < 0.05f) return NAN;
+      // Pri bezvetrí korouhvička len visí — hodnota by nemala význam.
+      if (!id(wind_speed).has_state() || id(wind_speed).state < ${wind_calm_threshold}) return NAN;
+
+      // Delič: korouhvička na 3V3, ${wind_pullup_res} Ω na GND, uzol na ADC.
+      float r_vane = ${wind_pullup_res} * ((3.3f / v) - 1.0f);
+
+      struct WindDir { float resistance; float angle; };
+      static const WindDir DIRS[] = {
+        {  688, 112.5f}, {  891,  67.5f}, { 1000,  90.0f}, { 1410, 157.5f},
+        { 2200, 135.0f}, { 3140, 202.5f}, { 3900, 180.0f}, { 6570,  22.5f},
+        { 8200,  45.0f}, {14120, 247.5f}, {16000, 225.0f}, {21880, 337.5f},
+        {33000,   0.0f}, {42120, 292.5f}, {64900, 315.0f}, {120000, 270.0f}
+      };
+
+      float best_ratio = 1000.0f;
+      float best_angle = NAN;
+      for (int i = 0; i < 16; i++) {
+        float ratio = fabsf(r_vane - DIRS[i].resistance) / DIRS[i].resistance;
+        if (ratio < best_ratio) { best_ratio = ratio; best_angle = DIRS[i].angle; }
+      }
+      if (best_ratio > ${wind_vane_tolerance}) {
+        ESP_LOGW("wind_dir", "Neznámy odpor: %.0f Ω (U = %.3f V)", r_vane, v);
+        return NAN;
+      }
+      return best_angle;
+
+  # ---------------------------------------------------------------------------
+  #  ZRÁŽKOMER (preklopná nádobka)
+  # ---------------------------------------------------------------------------
+  - platform: pulse_counter
+    pin:
+      number: ${pin_rain_bucket}
+      mode: INPUT_PULLUP
+    id: rain_pulses
+    internal: true
+    update_interval: ${rain_sample_interval}
+    use_pcnt: false
+    internal_filter: ${rain_debounce}
+    total:
+      id: rain_pulses_total
+      internal: true
+      accuracy_decimals: 0
+
+  - platform: template
+    name: "Celkové zrážky"
+    id: rain_total
+    unit_of_measurement: "mm"
+    accuracy_decimals: 2
+    device_class: precipitation
+    # total_increasing: HA z toho vie urobiť denné/mesačné úhrny cez utility_meter.
+    # Vo v2.x sa počítadlo resetovalo pri každom boote, takže táto entita bola
+    # v štatistikách nepoužiteľná.
+    state_class: total_increasing
+    update_interval: never
+    lambda: 'return (float) id(rain_tips_total) * ${rain_mm_per_tip};'
+
+  - platform: template
+    name: "Intenzita zrážok"
+    id: rain_fall_rate
+    unit_of_measurement: "mm/h"
+    accuracy_decimals: 1
+    device_class: precipitation_intensity
+    state_class: measurement
+    update_interval: never
+    # Skutočný priemer za uplynulý interval (nie za 60 s okno, ktoré sa počas
+    # bdenia aj tak nikdy nestihlo).
+    lambda: |-
+      float hours = id(rain_interval_seconds) / 3600.0f;
+      if (hours < 0.0005f) return NAN;
+      return (float) id(rain_tips_interval) * ${rain_mm_per_tip} / hours;
+
+  # ---------------------------------------------------------------------------
+  #  ANALÓGOVÝ DAŽĎOVÝ SENZOR (doštička)
+  # ---------------------------------------------------------------------------
+  - platform: adc
+    pin: ${pin_rain_analog}
+    id: rain_sensor_voltage
+    name: "Napätie dažďového senzora"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: never
+    attenuation: 12db
+    samples: 8
+
+  - platform: template
+    name: "Vlhkosť dažďového senzora"
+    id: rain_sensor_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: "mdi:water-percent"
+    update_interval: never
+    lambda: |-
+      if (!id(rain_sensor_voltage).has_state()) return NAN;
+      float val = id(rain_sensor_voltage).state;
+      float dry = ${rain_calib_dry};
+      float wet = ${rain_calib_wet};
+      if (fabsf(dry - wet) < 0.01f) return NAN;
+      return clamp((val - dry) / (wet - dry) * 100.0f, 0.0f, 100.0f);
+
+
+binary_sensor:
+  - platform: template
+    name: "Detekcia dažďa"
+    id: rain_detection
+    device_class: moisture
+    lambda: |-
+      bool analog = id(rain_sensor_percent).has_state() &&
+                    !isnan(id(rain_sensor_percent).state) &&
+                    id(rain_sensor_percent).state > ${rain_moisture_threshold};
+      bool bucket = id(rain_tips_interval) > 0;
+      return analog || bucket;

@@ -1,0 +1,173 @@
+# =============================================================================
+#  ODVODENÉ VELIČINY
+#
+#  Všetko sú template senzory s `update_interval: never` — publikuje ich
+#  výhradne skript main_cycle, takže sa vždy počítajú z čerstvých vstupov
+#  a v správnom poradí.
+# =============================================================================
+
+sensor:
+  # --- Tlak prepočítaný na hladinu mora --------------------------------------
+  - platform: template
+    name: "Tlak (Hladina mora)"
+    id: msl_pressure
+    unit_of_measurement: "hPa"
+    accuracy_decimals: 1
+    device_class: atmospheric_pressure
+    state_class: measurement
+    icon: "mdi:gauge"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_pressure).has_state()) return NAN;
+      float p = id(bme280_pressure).state;
+      float h = ${altitude_meters};
+      float t = id(bme280_temperature).has_state() ? id(bme280_temperature).state : 15.0f;
+      return p * powf(1.0f - (0.0065f * h) / (t + 0.0065f * h + 273.15f), -5.257f);
+
+  # --- Trend tlaku (počíta skript update_pressure_trend) ---------------------
+  - platform: template
+    name: "Tlakový trend"
+    id: pressure_trend_sensor
+    unit_of_measurement: "hPa/h"
+    accuracy_decimals: 2
+    state_class: measurement
+    icon: "mdi:trending-down"
+    update_interval: never
+    lambda: 'return id(pressure_trend_value);'
+
+  # --- Rosný bod (Magnus) ----------------------------------------------------
+  - platform: template
+    name: "Rosný bod"
+    id: dew_point
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    icon: "mdi:thermometer-water"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      if (RH <= 0.0f) return NAN;
+      const float a = 17.27f, b = 237.7f;
+      float alpha = ((a * T) / (b + T)) + logf(RH / 100.0f);
+      if (fabsf(a - alpha) < 0.001f) return NAN;
+      return (b * alpha) / (a - alpha);
+
+  # --- Absolútna vlhkosť -----------------------------------------------------
+  - platform: template
+    name: "Absolútna vlhkosť"
+    id: absolute_humidity
+    unit_of_measurement: "g/m³"
+    accuracy_decimals: 1
+    state_class: measurement
+    icon: "mdi:water"
+    update_interval: never
+    # OPRAVA v2.x: konštanta bola 2165 namiesto 216.7, výsledok bol 10× vyšší
+    # (pri 20 °C / 50 % RH hlásila ~86 g/m³ namiesto správnych ~8,6 g/m³).
+    # AH = e·M/(R·T);  M = 18.016 g/mol, R = 8.314 => 18.016/8.314·100 = 216.7
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      float es = 6.112f * expf((17.67f * T) / (T + 243.5f));   // [hPa]
+      return ((RH / 100.0f) * es * 216.7f) / (T + 273.15f);
+
+  # --- Thomov index nepohody -------------------------------------------------
+  - platform: template
+    name: "Index tepelného komfortu"
+    id: comfort_index
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    icon: "mdi:thermometer-check"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float T = id(bme280_temperature).state;
+      float RH = id(bme280_humidity).state;
+      return T - (0.55f - 0.0055f * RH) * (T - 14.5f);
+
+  # --- Pocitová teplota (wind chill / heat index) ----------------------------
+  - platform: template
+    name: "Pocitová teplota"
+    id: feels_like_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+    icon: "mdi:thermometer-lines"
+    update_interval: never
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(bme280_humidity).has_state()) return NAN;
+      float t = id(bme280_temperature).state;
+      float h = id(bme280_humidity).state;
+      float v = id(wind_speed).has_state() ? id(wind_speed).state : 0.0f;
+
+      // Wind chill (JAG/TI) platí pre t <= 10 °C a v >= 4.8 km/h
+      if (t <= 10.0f && v >= 4.8f)
+        return 13.12f + (0.6215f * t) - (11.37f * powf(v, 0.16f))
+               + (0.3965f * t * powf(v, 0.16f));
+
+      // Heat index (Rothfusz, °C) platí pre t >= 26 °C a RH >= 40 %
+      if (t >= 26.0f && h >= 40.0f) {
+        float hi = -8.785f + 1.611f * t + 2.339f * h - 0.146f * t * h
+                   - 0.013f * t * t - 0.016f * h * h + 0.002f * t * t * h
+                   + 0.001f * t * h * h - 0.000004f * t * t * h * h;
+        return (hi > t) ? hi : t;
+      }
+      return t;
+
+
+binary_sensor:
+  # POZOR: template binary_sensor NIE JE polling komponent — jeho lambda beží
+  # v loop(), teda stovky krát za sekundu. Preto tu nesmie byť žiadny vedľajší
+  # efekt (vo v2.x tu `rain_prediction` prepisovala históriu tlaku, čím ju
+  # kompletne znehodnotila). Zápisy do globals robí výhradne main_cycle.
+  #
+  # Z rovnakého dôvodu tu nie sú `delayed_on: 30s/60s` filtre — pri okne bdenia
+  # ~10 s by sa nikdy nedokončili a výstrahy by sa nezopli. Hysterézu je
+  # správne riešiť až v Home Assistante (`for:` v automatizácii).
+
+  - platform: template
+    name: "Riziko mrazu"
+    id: frost_risk
+    icon: "mdi:snowflake-alert"
+    lambda: |-
+      if (!id(bme280_temperature).has_state() || !id(dew_point).has_state()) return false;
+      return (id(bme280_temperature).state < ${frost_temp_threshold}) &&
+             (id(dew_point).state < 0.0f);
+
+  - platform: template
+    name: "Výstraha: Búrka"
+    id: storm_warning
+    icon: "mdi:weather-lightning-rainy"
+    lambda: 'return id(pressure_trend_value) < ${storm_pressure_drop};'
+
+  - platform: template
+    name: "Predikcia dažďa (Tlak)"
+    id: rain_prediction
+    icon: "mdi:weather-rainy"
+    lambda: |-
+      if (!id(bme280_pressure).has_state() || !id(bme280_humidity).has_state()) return false;
+      float cur_p = id(bme280_pressure).state;
+      float hum   = id(bme280_humidity).state;
+      float trend = id(pressure_trend_value);
+
+      // Priemer z histórie — len čítanie, žiadny zápis.
+      int valid = 0; float sum = 0.0f;
+      for (int i = 0; i < ${press_hist_size}; i++) {
+        float p = id(pressure_history)[i];
+        if (!isnan(p) && p > 800.0f) { sum += p; valid++; }
+      }
+      float avg = (valid >= 2) ? (sum / valid) : NAN;
+
+      bool hum_rising = !isnan(id(prev_humidity)) && ((hum - id(prev_humidity)) > 2.0f);
+
+      if (!isnan(avg) && trend < id(rain_pressure_trend_threshold)
+          && cur_p < avg && hum_rising) return true;
+      if (cur_p < 1000.0f && hum > id(humidity_threshold)) return true;
+      if (trend < ${storm_pressure_drop}) return true;
+      return false;

@@ -1,0 +1,78 @@
+# =============================================================================
+#  POWER — napájacie rails, batéria, deep sleep
+# =============================================================================
+
+output:
+  # POZOR (hardvér): pull-upy I2C zbernice MUSIA byť napájané z tejto spínanej
+  # vetvy. Ak visia na trvalej 3V3, senzory sa napájajú parazitne cez ochranné
+  # diódy na SDA/SCL a nikdy sa naozaj nevypnú.
+  - platform: gpio
+    pin: ${pin_i2c_power}
+    id: i2c_sensor_power
+
+  - platform: gpio
+    pin: ${pin_rain_power}
+    id: rain_sensor_power
+
+
+deep_sleep:
+  id: deep_sleep_control
+  # OPRAVA v2.x: bez tohto defaultu by `deep_sleep.enter` bez vypočítaného
+  # trvania (napr. cez prepínač "Vynútiť Deep Sleep" hneď po boote) uspal
+  # zariadenie NAVŽDY, až do manuálneho resetu.
+  sleep_duration: ${sleep_default}
+
+
+sensor:
+  # --- Napätie batérie -------------------------------------------------------
+  # Meria sa v main_cycle ako prvá vec, ešte kým WiFi nezaťaží zdroj.
+  - platform: adc
+    pin: ${pin_battery}
+    name: "Napätie batérie"
+    id: battery_voltage
+    update_interval: never
+    attenuation: 12db
+    samples: 16                 # hardvérové priemerovanie priamo v ADC
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: "V"
+    entity_category: diagnostic
+    filters:
+      - multiply: ${batt_multiplier}
+      - lambda: |-
+          if (x < 2.5f || x > 5.0f) {
+            ESP_LOGW("battery", "Podozrivé napätie: %.2f V", x);
+            return {};
+          }
+          return x;
+
+  # --- Percentá (po častiach lineárna krivka Li-ion) -------------------------
+  - platform: template
+    name: "Úroveň batérie"
+    id: battery_level
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    update_interval: never
+    lambda: |-
+      if (!id(battery_voltage).has_state()) return NAN;
+      float v = id(battery_voltage).state;
+      if (v >= 4.15f) return 100.0f;
+      if (v >= 4.00f) return 85.0f + (v - 4.00f) * 100.0f;
+      if (v >= 3.75f) return 35.0f + (v - 3.75f) * 200.0f;
+      if (v >= 3.50f) return 10.0f + (v - 3.50f) * 100.0f;
+      if (v >= 3.30f) return  2.0f + (v - 3.30f) *  40.0f;
+      if (v >= ${batt_min_voltage}) return 1.0f;
+      return 0.0f;
+
+
+binary_sensor:
+  - platform: template
+    name: "Kritická batéria"
+    id: low_battery
+    device_class: battery
+    lambda: |-
+      if (!id(battery_voltage).has_state()) return false;
+      return id(battery_voltage).state < (${batt_min_voltage} + 0.1f);
