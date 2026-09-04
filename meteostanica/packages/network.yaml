@@ -35,7 +35,9 @@ wifi:
           level: INFO
           tag: "wifi"
           format: "WiFi OK, RSSI %d dBm"
-          args: ['WiFi.RSSI()']
+          # POZOR: `WiFi.RSSI()` je Arduino API a na ESP-IDF sa nepreloží.
+          # Toto je natívny prístup cez ESPHome a funguje na oboch frameworkoch.
+          args: ['wifi::global_wifi_component->wifi_rssi()']
 
   on_disconnect:
     then:
