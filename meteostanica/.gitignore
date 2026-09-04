@@ -1,0 +1,6 @@
+# Nikdy necommitovať reálne prihlasovacie údaje
+secrets.yaml
+
+# Build artefakty ESPHome
+.esphome/
+*.bin

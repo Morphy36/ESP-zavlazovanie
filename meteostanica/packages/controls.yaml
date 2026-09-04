@@ -1,0 +1,118 @@
+# =============================================================================
+#  OVLÁDACIE PRVKY — prepínače, tlačidlá, konfiguračné čísla
+# =============================================================================
+
+switch:
+  # ---------------------------------------------------------------------------
+  #  OTA REŽIM — jediný spoľahlivý spôsob, ako udržať stanicu hore
+  #
+  #  Vo v2.x sa na to používalo `deep_sleep.prevent` v on_client_connected.
+  #  Nefungovalo to: akcia `deep_sleep.enter` volá begin_sleep(manual = true),
+  #  ktorá príznak `prevent_` zámerne obchádza. Stanica teda zaspala aj s
+  #  pripojeným HA klientom a OTA okno reálne neexistovalo.
+  #
+  #  Použitie: zapni prepínač v HA, počkaj na najbližšie prebudenie (max. dĺžka
+  #  aktuálneho režimu), stanica zostane online. Po nahratí firmvéru vypni.
+  # ---------------------------------------------------------------------------
+  - platform: template
+    name: "OTA režim (nespať)"
+    id: ota_mode
+    icon: "mdi:progress-upload"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # musí prežiť deep sleep
+    turn_on_action:
+      - logger.log:
+          level: INFO
+          tag: "ota"
+          format: "OTA režim ZAPNUTÝ — stanica zostane hore."
+      - script.stop: failsafe_guard
+    turn_off_action:
+      - logger.log:
+          level: INFO
+          tag: "ota"
+          format: "OTA režim vypnutý — idem spať pri najbližšej kontrole."
+
+  - platform: template
+    name: "Manuálne napájanie senzorov"
+    id: manual_sensor_power
+    icon: "mdi:power-plug"
+    entity_category: config
+    optimistic: true
+    turn_on_action:
+      - output.turn_on: rain_sensor_power
+      - output.turn_on: i2c_sensor_power
+    turn_off_action:
+      - output.turn_off: rain_sensor_power
+      - output.turn_off: i2c_sensor_power
+
+  - platform: restart
+    name: "Reštartovať stanicu"
+    entity_category: config
+
+
+button:
+  - platform: template
+    name: "Vynútiť Deep Sleep"
+    icon: "mdi:sleep"
+    entity_category: config
+    on_press:
+      # Bezpečné aj hneď po boote — deep_sleep má nakonfigurovaný default
+      # sleep_duration (packages/power.yaml).
+      - deep_sleep.enter: deep_sleep_control
+
+  - platform: template
+    name: "Reset diagnostiky"
+    icon: "mdi:restore"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(sensor_error_count) = 0;
+          id(wifi_fail_count) = 0;
+          ESP_LOGI("diag", "Diagnostické počítadlá resetované.");
+
+  - platform: template
+    name: "Reset počítadla zrážok"
+    icon: "mdi:water-off"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(rain_tips_total) = 0;
+          id(rain_tips_interval) = 0;
+          ESP_LOGI("rain", "Počítadlo zrážok vynulované.");
+      - component.update: rain_total
+
+
+number:
+  # Obidve hodnoty majú vlastnú `restore_value` globálku (packages/core.yaml),
+  # takže prežijú deep sleep aj bez týchto entít. initial_value tu musí sedieť
+  # s initial_value danej globálky.
+  - platform: template
+    name: "Prah trendu tlaku (predikcia dažďa)"
+    id: rain_trend_threshold_config
+    unit_of_measurement: "hPa/h"
+    min_value: -5.0
+    max_value: 0.0
+    step: 0.1
+    initial_value: -1.5
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    mode: box
+    set_action:
+      - lambda: 'id(rain_pressure_trend_threshold) = x;'
+
+  - platform: template
+    name: "Prah vlhkosti pre dážď"
+    id: humidity_threshold_config
+    unit_of_measurement: "%"
+    min_value: 60.0
+    max_value: 95.0
+    step: 1.0
+    initial_value: 80.0
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    mode: box
+    set_action:
+      - lambda: 'id(humidity_threshold) = x;'

@@ -1,0 +1,179 @@
+# =============================================================================
+#  CORE — základ zariadenia, boot sekvencia, globálne premenné
+# =============================================================================
+
+esphome:
+  name: ${dev_name}
+  friendly_name: ${friendly_name}
+  comment: "Solárna meteostanica s adaptívnym deep sleep"
+  project:
+    name: "morphy.meteostanica"
+    version: "3.0.0"
+
+  on_boot:
+    # -------------------------------------------------------------------------
+    # FÁZA 1 — priorita 750
+    #
+    # Prečo práve 750: ESPHome inicializuje komponenty od najvyššej priority.
+    #   800 = HARDWARE  -> GPIO výstupy a `globals` s restore_value
+    #   600 = DATA      -> I2C senzory (BME280, LTR390)
+    # Pri 750 sú teda globals už obnovené z RTC pamäte a GPIO výstupy funkčné,
+    # ale I2C senzory ešte nebežali setup(). Zapneme im napájanie práve tu, takže
+    # ich vlastný setup() už prebehne na napájanom zariadení — a nie je potrebný
+    # žiadny manuálny I2C "recovery"/power-cycle ako vo v2.x.
+    # -------------------------------------------------------------------------
+    - priority: 750
+      then:
+        - lambda: |-
+            id(boot_count) += 1;
+            // Monotónny čas stanice — jediná spoľahlivá časová os pre trend tlaku.
+            // Prirátame spánok, ktorý práve skončil (čas bdenia sa doráta neskôr).
+            id(station_seconds) += id(last_sleep_duration_s);
+            id(seconds_since_report) += id(last_sleep_duration_s);
+            ESP_LOGI("boot", "=== BOOT #%d | t=%.0f s ===", id(boot_count), id(station_seconds));
+        - output.turn_on: i2c_sensor_power
+        - output.turn_on: rain_sensor_power
+        # Zámerne BLOKUJÚCE čakanie (nie `- delay:`, ktorý by iba odložil zvyšok
+        # automatizácie a nechal setup() bežať ďalej). Musí byť krátke.
+        - lambda: 'delay(${sensor_power_settle_ms});'
+
+    # -------------------------------------------------------------------------
+    # FÁZA 2 — priorita -100: všetky komponenty sú inicializované
+    # -------------------------------------------------------------------------
+    - priority: -100
+      then:
+        - script.execute: failsafe_guard
+        - script.execute: main_cycle
+
+  on_shutdown:
+    then:
+      - logger.log:
+          level: INFO
+          tag: "shutdown"
+          format: "Vypínam senzory."
+      - output.turn_off: rain_sensor_power
+      - output.turn_off: i2c_sensor_power
+
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+
+logger:
+  level: ${log_level}
+  baud_rate: 0        # UART vypnutý — šetrí prúd, logy idú cez API
+  logs:
+    # Tieto komponenty by pri INFO zaplavili log publikovaním každej hodnoty.
+    sensor: WARN
+    binary_sensor: WARN
+    text_sensor: WARN
+    # Blokujúce `delay()` v boote inak vypíše "took a long time" varovanie.
+    component: ERROR
+
+
+# =============================================================================
+#  GLOBÁLNE PREMENNÉ
+#
+#  restore_value: true  -> prežije deep sleep (RTC pamäť + NVS)
+#  restore_value: false -> platí len v rámci jedného bootu
+# =============================================================================
+globals:
+  # --- História tlaku (kruhový buffer) ---
+  # POZOR: počet prvkov v initial_value musí sedieť s ${press_hist_size}.
+  - id: pressure_history
+    type: float[${press_hist_size}]
+    restore_value: true
+    initial_value: "{NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN}"
+
+  # Časová os histórie v sekundách od prvého bootu (nie číslo bootu!).
+  # v2.x tu mala boot_count a prepočítavala ho AKTUÁLNOU dĺžkou spánku, čo dávalo
+  # nesprávne výsledky vždy, keď stanica prepla režim (2 / 5 / 10 / 30 min).
+  - id: pressure_time_s
+    type: float[${press_hist_size}]
+    restore_value: true
+    initial_value: "{NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN}"
+
+  - id: history_index
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: pressure_trend_value
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  - id: prev_humidity
+    type: float
+    restore_value: true
+    initial_value: "NAN"
+
+  # --- Čas ---
+  - id: station_seconds
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  - id: last_sleep_duration_s
+    type: float
+    restore_value: true
+    initial_value: "600.0"
+
+  # --- Zrážky (perzistentné, aby HA nevidela reset na 0 pri každom boote) ---
+  - id: rain_tips_total
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  # Preklopenia napočítané v poslednom nahlásenom intervale a jeho dĺžka.
+  # Držia sa oddelene od akumulátora, aby sa hodnoty senzorov nemenili
+  # uprostred okna bdenia (binárne senzory bežia v loop()).
+  - id: rain_tips_interval
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: rain_interval_seconds
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  # Beží od posledného hlásenia; v main_cycle sa prelieva do rain_interval_seconds.
+  - id: seconds_since_report
+    type: float
+    restore_value: true
+    initial_value: "0.0"
+
+  # --- Konfigurovateľné prahy (viazané na `number` entity) ---
+  - id: rain_pressure_trend_threshold
+    type: float
+    restore_value: true
+    initial_value: "-1.5"
+
+  - id: humidity_threshold
+    type: float
+    restore_value: true
+    initial_value: "80.0"
+
+  # --- Diagnostika ---
+  - id: boot_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: last_sleep_mode
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: wifi_fail_count
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  - id: sensor_error_count
+    type: int
+    restore_value: true
+    initial_value: "0"

@@ -1,0 +1,95 @@
+# =============================================================================
+#  I2C SENZORY — BME280 (T/RH/p) a LTR390 (svetlo + UV)
+#
+#  Obidva majú `update_interval: never` — číta ich výhradne skript main_cycle,
+#  aby bolo poradie operácií v okne bdenia deterministické.
+# =============================================================================
+
+i2c:
+  id: busa
+  sda: ${pin_sda}
+  scl: ${pin_scl}
+  scan: false          # adresy poznáme, sken len zdržuje boot
+  frequency: 100kHz
+  timeout: 50ms
+
+
+sensor:
+  # --- BME280 ---------------------------------------------------------------
+  - platform: bme280_i2c
+    address: 0x76
+    i2c_id: busa
+    id: bme280_sensor
+    update_interval: never
+
+    temperature:
+      name: "Vonkajšia Teplota"
+      id: bme280_temperature
+      oversampling: 4x
+      filters:
+        # Odmietnutie fyzikálne nemožných hodnôt. Filter iba validuje —
+        # počítadlo chýb sa aktualizuje v main_cycle, pretože filtre sa môžu
+        # vyhodnotiť viackrát a vedľajšie efekty v nich sú nespoľahlivé.
+        - lambda: |-
+            if (x < -40.0f || x > 60.0f) {
+              ESP_LOGW("bme280", "Odmietnutá teplota: %.1f °C", x);
+              return {};
+            }
+            return x;
+
+    pressure:
+      name: "Absolútny tlak"
+      id: bme280_pressure
+      oversampling: 4x
+      filters:
+        - lambda: |-
+            if (x < 800.0f || x > 1100.0f) {
+              ESP_LOGW("bme280", "Odmietnutý tlak: %.1f hPa", x);
+              return {};
+            }
+            return x;
+
+    humidity:
+      name: "Vonkajšia Vlhkosť"
+      id: bme280_humidity
+      oversampling: 4x
+      filters:
+        - lambda: |-
+            if (x < 0.0f || x > 100.0f) {
+              ESP_LOGW("bme280", "Odmietnutá vlhkosť: %.1f %%", x);
+              return {};
+            }
+            return x;
+
+  # --- LTR390 ---------------------------------------------------------------
+  - platform: ltr390
+    address: 0x53
+    i2c_id: busa
+    id: ltr390_sensor
+    update_interval: never
+    gain: "X3"
+    resolution: 18
+    # Kompenzácia útlmu krytu (1.0 = senzor priamo na vzduchu).
+    window_correction_factor: ${uv_window_factor}
+
+    light:
+      name: "Intenzita svetla"
+      id: ambient_light
+      filters:
+        - lambda: 'return (x < 0.0f) ? 0.0f : x;'
+
+    # OPRAVA v2.x: UV index sa počítal ako raw/170 — magická konštanta viazaná
+    # na konkrétny gain a rozlíšenie. Komponent ltr390 to vie sám a správne,
+    # vrátane window_correction_factor.
+    uv_index:
+      name: "UV Index"
+      id: uv_index_sensor
+      accuracy_decimals: 1
+      filters:
+        - lambda: |-
+            if (x < 0.0f) return 0.0f;
+            if (x > 15.0f) {
+              ESP_LOGW("uv", "Nereálny UVI: %.1f", x);
+              return {};
+            }
+            return x;

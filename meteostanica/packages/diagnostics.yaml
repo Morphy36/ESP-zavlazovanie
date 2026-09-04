@@ -1,0 +1,78 @@
+# =============================================================================
+#  DIAGNOSTIKA
+# =============================================================================
+
+binary_sensor:
+  - platform: status
+    name: "Status stanice"
+
+  - platform: template
+    name: "Chyba senzorov"
+    id: sensor_problem
+    device_class: problem
+    entity_category: diagnostic
+    lambda: 'return id(sensor_error_count) > 0;'
+
+
+sensor:
+  - platform: uptime
+    name: "Čas behu"
+    id: uptime_sensor
+    entity_category: diagnostic
+    # Vo v2.x bolo `1s`, čo pri deep sleep znamenalo ~10 zbytočných publikácií
+    # za cyklus do HA recordera. Publikuje sa raz, v main_cycle.
+    update_interval: never
+
+  - platform: wifi_signal
+    name: "WiFi signál"
+    id: wifi_signal_dbm
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: copy
+    source_id: wifi_signal_dbm
+    name: "Kvalita WiFi"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    filters:
+      - lambda: |-
+          if (x <= -100.0f) return 0.0f;
+          if (x >=  -50.0f) return 100.0f;
+          return 2.0f * (x + 100.0f);
+
+  # Pozn.: pôvodný ESP32 nemá poriadny teplotný senzor jadra (hodnota pochádza
+  # z PHY bloku a je len orientačná). Nechané ako diagnostika, nie ako meranie.
+  - platform: internal_temperature
+    name: "Teplota CPU"
+    id: cpu_temperature
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    name: "Počet bootov"
+    id: boot_count_sensor
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: never
+    lambda: 'return (float) id(boot_count);'
+
+  - platform: template
+    name: "WiFi zlyhania (za sebou)"
+    id: wifi_fail_sensor
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: never
+    lambda: 'return (float) id(wifi_fail_count);'
+
+  - platform: template
+    name: "Chyby senzorov (za sebou)"
+    id: sensor_error_sensor
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: never
+    lambda: 'return (float) id(sensor_error_count);'

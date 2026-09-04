@@ -1,0 +1,108 @@
+# =============================================================================
+#  VONKAJŠIA METEOSTANICA — ESPHome konfigurácia v3.0.0
+# =============================================================================
+#  Hlavný súbor. Obsahuje LEN substitúcie (ladiace hodnoty) a zoznam balíčkov.
+#  Samotná logika je v packages/ — pozri README.md.
+#
+#  Kompilácia:  esphome run meteostanica.yaml
+#  Kontrola:    esphome config meteostanica.yaml
+# =============================================================================
+
+substitutions:
+  # --- Identita zariadenia ---------------------------------------------------
+  dev_name: "vonkajsia-stanica"
+  friendly_name: "Vonkajšia Meteostanica"
+
+  # --- Umiestnenie -----------------------------------------------------------
+  altitude_meters: "250"          # nadmorská výška [m] pre prepočet tlaku na MSL
+
+  # --- Piny (pozri tabuľku zapojenia v README.md) ----------------------------
+  pin_sda: "GPIO22"
+  pin_scl: "GPIO21"
+  pin_battery: "GPIO35"           # ADC1 – delič napätia batérie
+  pin_rain_analog: "GPIO34"       # ADC1 – analógový dažďový senzor (doštička)
+  pin_wind_vane: "GPIO33"         # ADC1 – korouhvička (smer vetra)
+  pin_wind_speed: "GPIO25"        # RTC GPIO – anemometer (jazýčkový kontakt)
+  pin_rain_bucket: "GPIO26"       # RTC GPIO – zrážkomer (preklopná nádobka)
+  pin_rain_power: "GPIO18"        # napájanie analógového dažďového senzora
+  pin_i2c_power: "GPIO19"         # napájanie I2C vetvy (BME280 + LTR390)
+
+  # --- Napájanie senzorov ----------------------------------------------------
+  # Blokujúce čakanie po zapnutí railu, ešte PRED setup() I2C komponentov.
+  # BME280 t_startup = 2 ms, LTR390 potrebuje ~100 ms.
+  sensor_power_settle_ms: "120"
+
+  # --- Batéria ---------------------------------------------------------------
+  batt_multiplier: "2.0"          # pomer deliča (2× 100 kΩ => 2.0)
+  batt_min_voltage: "3.0"
+
+  # --- Časy spánku (adaptívny režim) -----------------------------------------
+  sleep_default: "10min"          # BEZPEČNÝ default pre deep_sleep komponent
+  sleep_storm_mode_ms: "120000"   # 2 min  – dážď / vietor / búrka
+  sleep_normal_mode_ms: "600000"  # 10 min – bežná prevádzka
+  sleep_eco_mode_ms: "1800000"    # 30 min – slabá batéria
+  sleep_perf_mode_ms: "300000"    # 5 min  – plná batéria
+  sleep_failsafe: "4min"          # ak cyklus zamrzne, po tomto čase núdzový spánok
+  sleep_no_wifi_ms: "300000"      # 5 min – WiFi alebo API nedostupné
+  sleep_wifi_dead_ms: "1800000"   # 30 min – po `wifi_fail_limit` neúspechoch
+  wifi_fail_limit: "5"
+
+  # --- Okno bdenia -----------------------------------------------------------
+  wifi_wait_timeout: "15s"
+  api_wait_timeout: "10s"
+  publish_flush_delay: "600ms"    # čas na odoslanie stavov do HA pred spánkom
+  wifi_ap_timeout: "1min"
+  wifi_tx_power: "8.5dBm"
+
+  # --- Kalibrácia dažďového senzora (analógová doštička) ---------------------
+  rain_calib_dry: "1.033"         # napätie na suchu [V]
+  rain_calib_wet: "0.419"         # napätie pri úplnom zmáčaní [V]
+
+  # --- Anemometer a zrážkomer ------------------------------------------------
+  wind_pulse_to_kmh: "0.04"       # pulzy/min -> km/h (1 ot./s = 2.4 km/h)
+  wind_sample_interval: "3s"
+  wind_debounce: "5ms"            # zákmity jazýčka; 5 ms => strop cca 240 km/h
+  wind_calm_threshold: "0.3"      # pod touto rýchlosťou hlásime bezvetrie
+  rain_mm_per_tip: "0.2794"       # objem jednej preklopnej nádobky [mm]
+  rain_sample_interval: "5s"
+  rain_debounce: "200ms"          # preklopenie je pomalé, filtrujeme naozaj tvrdo
+
+  # --- Korouhvička -----------------------------------------------------------
+  wind_pullup_res: "10000"        # odpor voči GND [Ω]
+  wind_vane_tolerance: "0.15"     # max. relatívna odchýlka od tabuľkového odporu
+
+  # --- UV --------------------------------------------------------------------
+  uv_window_factor: "1.0"         # >1.0 ak je senzor za sklom/plexi
+
+  # --- Prahy -----------------------------------------------------------------
+  wind_storm_threshold: "15.0"    # km/h – nad tým prepni na častejšie meranie
+  bat_eco_threshold: "20.0"       # %
+  bat_storm_min: "30.0"           # %
+  bat_perf_threshold: "80.0"      # %
+  rain_moisture_threshold: "15.0" # % vlhkosti analógovej doštičky
+  frost_temp_threshold: "3.0"     # °C
+  storm_pressure_drop: "-2.5"     # hPa/h
+
+  # --- História tlaku --------------------------------------------------------
+  # POZOR: pri zmene je nutné upraviť aj initial_value v packages/core.yaml!
+  press_hist_size: "8"
+
+  # --- Logovanie -------------------------------------------------------------
+  # INFO počas ladenia deep sleepu, WARN v bežnej prevádzke.
+  log_level: "INFO"
+
+
+# =============================================================================
+#  BALÍČKY
+# =============================================================================
+packages:
+  core:       !include packages/core.yaml
+  network:    !include packages/network.yaml
+  power:      !include packages/power.yaml
+  i2c_bus:    !include packages/sensors_i2c.yaml
+  wind_rain:  !include packages/sensors_wind_rain.yaml
+  derived:    !include packages/derived.yaml
+  texts:      !include packages/text_sensors.yaml
+  controls:   !include packages/controls.yaml
+  diagnostic: !include packages/diagnostics.yaml
+  logic:      !include packages/scripts.yaml
