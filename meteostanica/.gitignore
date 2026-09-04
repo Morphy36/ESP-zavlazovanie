@@ -4,3 +4,4 @@ secrets.yaml
 # Build artefakty ESPHome
 .esphome/
 *.bin
+secrets.doplnit.txt
